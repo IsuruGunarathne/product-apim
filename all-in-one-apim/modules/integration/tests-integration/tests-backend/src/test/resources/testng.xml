@@ -464,7 +464,6 @@
     <test name="apim-ssrf-protection-tests" preserve-order="true" parallel="false" group-by-instances="true">
         <parameter name="group" value="group2"/>
         <classes>
-            <class name="org.wso2.am.integration.tests.other.AdvancedConfigDeploymentConfig"/>
             <class name="org.wso2.am.integration.tests.other.SSRFProtectionTestCase"/>
         </classes>
     </test>
