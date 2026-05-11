@@ -64,6 +64,7 @@ public class SSRFPrivateBlockTestCase extends APIMIntegrationBaseTest {
     public void testPrivateNetworkBlock_MultipleAPISurfacesBlocked() throws Exception {
         ApiEndpointValidationResponseDTO endpointDto =
                 restAPIPublisher.validateEndpointRaw(LOOPBACK_URL, apiId);
+        Assert.assertNotNull(endpointDto, "Endpoint validation response must not be null");
         Assert.assertNotNull(endpointDto.getError(),
                 "Expected SSRF error for loopback URL when block_private_network_access=true");
         Assert.assertTrue(endpointDto.getError().contains("not trusted"),
