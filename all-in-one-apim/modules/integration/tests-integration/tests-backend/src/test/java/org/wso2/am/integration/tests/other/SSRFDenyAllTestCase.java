@@ -85,11 +85,17 @@ public class SSRFDenyAllTestCase extends APIMIntegrationBaseTest {
 
     @AfterClass(alwaysRun = true)
     public void destroy() throws Exception {
-        restoreOriginalTenantConfig();
-        if (apiId != null) {
-            restAPIPublisher.deleteAPI(apiId);
+        try {
+            restoreOriginalTenantConfig();
+        } finally {
+            try {
+                if (apiId != null) {
+                    restAPIPublisher.deleteAPI(apiId);
+                }
+            } finally {
+                super.cleanUp();
+            }
         }
-        super.cleanUp();
     }
 
     private void enableTenantAllowlist(String[] patterns) throws Exception {
