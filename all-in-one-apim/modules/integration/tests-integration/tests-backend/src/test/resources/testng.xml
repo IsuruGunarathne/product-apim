@@ -461,10 +461,35 @@
             <class name="org.wso2.am.integration.tests.workflow.WorkflowApprovalExecutorTest"/>
         </classes>
     </test>
-    <test name="apim-ssrf-protection-tests" preserve-order="true" parallel="false" group-by-instances="true">
+    <test name="apim-ssrf-allowall-tests" preserve-order="true" parallel="false" group-by-instances="true">
         <parameter name="group" value="group2"/>
         <classes>
+            <class name="org.wso2.am.integration.tests.other.SSRFAllowAllTestSuite"/>
             <class name="org.wso2.am.integration.tests.other.SSRFProtectionTestCase"/>
+        </classes>
+    </test>
+
+    <test name="apim-ssrf-privateblock-tests" preserve-order="true" parallel="false" group-by-instances="true">
+        <parameter name="group" value="group2"/>
+        <classes>
+            <class name="org.wso2.am.integration.tests.other.SSRFPrivateBlockTestSuite"/>
+            <class name="org.wso2.am.integration.tests.other.SSRFPrivateBlockTestCase"/>
+        </classes>
+    </test>
+
+    <test name="apim-ssrf-denyall-tests" preserve-order="true" parallel="false" group-by-instances="true">
+        <parameter name="group" value="group2"/>
+        <classes>
+            <class name="org.wso2.am.integration.tests.other.SSRFDenyAllTestSuite"/>
+            <class name="org.wso2.am.integration.tests.other.SSRFDenyAllTestCase"/>
+        </classes>
+    </test>
+
+    <test name="apim-ssrf-disabled-tests" preserve-order="true" parallel="false" group-by-instances="true">
+        <parameter name="group" value="group2"/>
+        <classes>
+            <class name="org.wso2.am.integration.tests.other.SSRFDisabledTestSuite"/>
+            <class name="org.wso2.am.integration.tests.other.SSRFDisabledTestCase"/>
         </classes>
     </test>
     <test name="apim-logging-tests" preserve-order="true" parallel="false" group-by-instances="true">
