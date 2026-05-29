@@ -461,11 +461,11 @@
             <class name="org.wso2.am.integration.tests.workflow.WorkflowApprovalExecutorTest"/>
         </classes>
     </test>
-    <test name="apim-ssrf-allowall-tests" preserve-order="true" parallel="false" group-by-instances="true">
+    <test name="apim-ssrf-tenant-allow-mode-tests" preserve-order="true" parallel="false" group-by-instances="true">
         <parameter name="group" value="group2"/>
         <classes>
-            <class name="org.wso2.am.integration.tests.other.SSRFAllowAllTestSuite"/>
-            <class name="org.wso2.am.integration.tests.other.SSRFProtectionTestCase"/>
+            <class name="org.wso2.am.integration.tests.other.SSRFTenantAllowModeTestSuite"/>
+            <class name="org.wso2.am.integration.tests.other.SSRFTenantAllowModeTestCase"/>
         </classes>
     </test>
 
@@ -477,11 +477,11 @@
         </classes>
     </test>
 
-    <test name="apim-ssrf-denyall-tests" preserve-order="true" parallel="false" group-by-instances="true">
+    <test name="apim-ssrf-allow-mode-tests" preserve-order="true" parallel="false" group-by-instances="true">
         <parameter name="group" value="group2"/>
         <classes>
-            <class name="org.wso2.am.integration.tests.other.SSRFDenyAllTestSuite"/>
-            <class name="org.wso2.am.integration.tests.other.SSRFDenyAllTestCase"/>
+            <class name="org.wso2.am.integration.tests.other.SSRFAllowModeTestSuite"/>
+            <class name="org.wso2.am.integration.tests.other.SSRFAllowModeTestCase"/>
         </classes>
     </test>
 

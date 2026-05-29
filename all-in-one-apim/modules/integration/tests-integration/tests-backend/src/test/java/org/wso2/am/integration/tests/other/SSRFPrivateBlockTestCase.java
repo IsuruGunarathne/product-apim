@@ -31,10 +31,8 @@ import org.wso2.am.integration.clients.admin.api.dto.KeyManagerDTO;
 import org.wso2.am.integration.clients.publisher.api.v1.dto.ApiEndpointValidationResponseDTO;
 import org.wso2.am.integration.test.impl.DtoFactory;
 import org.wso2.am.integration.test.utils.base.APIMIntegrationBaseTest;
-import org.wso2.am.integration.test.utils.bean.APIRequest;
 import org.wso2.carbon.automation.engine.context.TestUserMode;
 
-import java.net.URL;
 import java.util.Collections;
 import java.util.Map;
 
@@ -43,27 +41,18 @@ import java.util.Map;
  */
 public class SSRFPrivateBlockTestCase extends APIMIntegrationBaseTest {
 
-    private static final String LOOPBACK_URL   = "http://127.0.0.1:9999/api";
-    private static final String LINK_LOCAL_URL = "http://169.254.169.254/latest/meta-data/";
-
-    private String apiId;
+    private static final String LOOPBACK_URL = "http://127.0.0.1:9999/api";
 
     @BeforeClass(alwaysRun = true)
     public void setEnvironment() throws Exception {
         super.init(TestUserMode.SUPER_TENANT_ADMIN);
-        APIRequest apiRequest = new APIRequest("SSRFPrivateBlockTestAPI", "/ssrfprivateblock",
-                new URL(backEndServerUrl.getWebAppURLHttp()
-                        + "jaxrs_basic/services/customers/customerservice/"));
-        apiRequest.setVersion("1.0.0");
-        apiRequest.setProvider(user.getUserName());
-        apiId = restAPIPublisher.addAPI(apiRequest).getData();
     }
 
     @Test(groups = {"wso2.am"},
             description = "SSRF [bpna=true]: loopback/link-local blocked across endpoint validation, KM create, and WSDL import")
     public void testPrivateNetworkBlock_MultipleAPISurfacesBlocked() throws Exception {
         ApiEndpointValidationResponseDTO endpointDto =
-                restAPIPublisher.validateEndpointRaw(LOOPBACK_URL, apiId);
+                restAPIPublisher.validateEndpointRaw(LOOPBACK_URL, null);
         Assert.assertNotNull(endpointDto, "Endpoint validation response must not be null");
         Assert.assertNotNull(endpointDto.getError(),
                 "Expected SSRF error for loopback URL when block_private_network_access=true");
@@ -81,6 +70,8 @@ public class SSRFPrivateBlockTestCase extends APIMIntegrationBaseTest {
         } catch (ApiException e) {
             Assert.assertEquals(e.getCode(), HttpStatus.SC_BAD_REQUEST,
                     "Expected HTTP 400 for KM with link-local (169.254.x.x) URL");
+            Assert.assertTrue(e.getResponseBody() != null && e.getResponseBody().contains("not trusted"),
+                    "Expected SSRF block error in KM create response body, got: " + e.getResponseBody());
         }
 
         try {
@@ -93,14 +84,13 @@ public class SSRFPrivateBlockTestCase extends APIMIntegrationBaseTest {
         } catch (org.wso2.am.integration.clients.publisher.api.ApiException e) {
             Assert.assertEquals(e.getCode(), HttpStatus.SC_BAD_REQUEST,
                     "Expected HTTP 400 for WSDL import from loopback address");
+            Assert.assertTrue(e.getResponseBody() != null && e.getResponseBody().contains("not trusted"),
+                    "Expected SSRF block error in WSDL import response body, got: " + e.getResponseBody());
         }
     }
 
     @AfterClass(alwaysRun = true)
     public void destroy() throws Exception {
-        if (apiId != null) {
-            restAPIPublisher.deleteAPI(apiId);
-        }
         super.cleanUp();
     }
 

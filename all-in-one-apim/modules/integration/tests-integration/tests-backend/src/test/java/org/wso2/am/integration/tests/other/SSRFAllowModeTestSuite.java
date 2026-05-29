@@ -28,7 +28,11 @@ import org.wso2.carbon.integration.common.utils.mgt.ServerConfigurationManager;
 
 import java.io.File;
 
-public class SSRFAllowAllTestSuite extends APIManagerLifecycleBaseTest {
+/**
+ * Test suite that applies platform-level allow mode configuration (NetworkSecurityAccessControl
+ * mode=allow with block_private_network_access=true) before running {@link SSRFAllowModeTestCase}.
+ */
+public class SSRFAllowModeTestSuite extends APIManagerLifecycleBaseTest {
 
     private ServerConfigurationManager serverConfigurationManager;
 
@@ -38,7 +42,7 @@ public class SSRFAllowAllTestSuite extends APIManagerLifecycleBaseTest {
                 APIMIntegrationConstants.AM_KEY_MANAGER_INSTANCE, TestUserMode.SUPER_TENANT_ADMIN);
         serverConfigurationManager = new ServerConfigurationManager(superTenantKeyManagerContext);
         serverConfigurationManager.applyConfiguration(new File(getAMResourceLocation()
-                + File.separator + "configFiles" + File.separator + "ssrfAllowAllBpnaDisabled"
+                + File.separator + "configFiles" + File.separator + "ssrfAllowModeBpnaEnabled"
                 + File.separator + "deployment.toml"));
     }
 

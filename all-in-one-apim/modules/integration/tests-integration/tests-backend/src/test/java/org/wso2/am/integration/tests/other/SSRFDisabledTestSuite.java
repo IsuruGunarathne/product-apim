@@ -28,6 +28,10 @@ import org.wso2.carbon.integration.common.utils.mgt.ServerConfigurationManager;
 
 import java.io.File;
 
+/**
+ * Test suite that applies a configuration with no SSRF protection settings, effectively
+ * disabling all platform-level SSRF checks, before running {@link SSRFDisabledTestCase}.
+ */
 public class SSRFDisabledTestSuite extends APIManagerLifecycleBaseTest {
 
     private ServerConfigurationManager serverConfigurationManager;
