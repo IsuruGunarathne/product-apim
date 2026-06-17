@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+            xmlns:t="urn:ssrf:imported" targetNamespace="urn:ssrf:main">
+    <xsd:import namespace="urn:ssrf:imported"
+                schemaLocation="http://127.0.0.1:8765/imported.xsd"/>
+    <xsd:element name="root" type="xsd:string"/>
+</xsd:schema>

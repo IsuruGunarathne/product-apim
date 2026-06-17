@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE xsd:schema SYSTEM "http://127.0.0.1:8766/evil.dtd">
+<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema" targetNamespace="urn:ssrf:dtd">
+    <xsd:element name="root" type="xsd:string"/>
+</xsd:schema>
