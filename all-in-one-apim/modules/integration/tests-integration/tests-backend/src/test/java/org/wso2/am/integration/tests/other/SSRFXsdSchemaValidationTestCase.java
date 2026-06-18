@@ -18,38 +18,30 @@
 
 package org.wso2.am.integration.tests.other;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.http.HttpStatus;
-import org.apache.http.client.methods.CloseableHttpResponse;
-import org.apache.http.client.methods.HttpDelete;
-import org.apache.http.impl.client.CloseableHttpClient;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 import org.wso2.am.integration.clients.publisher.api.v1.dto.APIDTO;
+import org.wso2.am.integration.clients.publisher.api.v1.dto.APIInfoDTO;
+import org.wso2.am.integration.clients.publisher.api.v1.dto.APIListDTO;
+import org.wso2.am.integration.clients.publisher.api.v1.dto.APIOperationPoliciesDTO;
 import org.wso2.am.integration.clients.publisher.api.v1.dto.APIOperationsDTO;
-import org.wso2.am.integration.clients.publisher.api.v1.dto.APIThreatProtectionPoliciesDTO;
-import org.wso2.am.integration.clients.publisher.api.v1.dto.APIThreatProtectionPoliciesListDTO;
+import org.wso2.am.integration.clients.publisher.api.v1.dto.OperationPolicyDTO;
+import org.wso2.am.integration.clients.store.api.v1.dto.ApplicationDTO;
 import org.wso2.am.integration.clients.store.api.v1.dto.ApplicationKeyDTO;
 import org.wso2.am.integration.clients.store.api.v1.dto.ApplicationKeyGenerateRequestDTO;
-import org.wso2.am.integration.test.utils.base.APIMIntegrationBaseTest;
 import org.wso2.am.integration.test.utils.base.APIMIntegrationConstants;
+import org.wso2.am.integration.test.utils.base.APIManagerLifecycleBaseTest;
 import org.wso2.am.integration.test.utils.http.HTTPSClientUtils;
-import org.wso2.carbon.automation.engine.context.TestUserMode;
 import org.wso2.carbon.automation.test.utils.http.client.HttpResponse;
 
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
-import java.io.IOException;
-import java.security.cert.X509Certificate;
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -66,69 +58,80 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
  * Integration tests for SSRF protection of {@code xsdURL} in the gateway XML schema validator.
  *
  * <p>The {@code XMLSchemaValidator} mediator fetches the publisher-configured {@code xsdURL} (and any
- * nested {@code xsd:import}/{@code xsd:include}/external-DTD refs inside the fetched XSD) through the
- * network access-control policy ({@code [apim.network_security.access_control]} in {@code deployment.toml}).
+ * nested {@code xsd:import}/{@code xsd:include}/external-DTD refs inside the fetched XSD) at request time.
+ * Every such fetch is routed through {@code APIUtil.validateRemoteURL}, governed by the
+ * {@code [apim.network_security.access_control]} policy in {@code deployment.toml}. This suite proves the
+ * gate is applied to the top-level {@code xsdURL} <em>and</em> to nested imports and external DTDs, per host.
  *
- * <p><b>Test topology</b>
+ * <p><b>How the API is wired (the real mechanism):</b> the feature is exercised through a custom
+ * <em>common operation policy</em> named {@code xsdValidator} (spec {@code operationPolicy/xsdValidator.json}
+ * + Synapse definition {@code operationPolicy/xsdValidator.j2}). The policy exposes an {@code xsdURL}
+ * parameter and places the {@code XMLSchemaValidator} mediator in the request flow. The policy is attached to
+ * a POST operation; changing {@code xsdURL} per case means updating the operation policy parameter and
+ * deploying a new revision.
+ *
+ * <p><b>Dummy backend:</b> {@code http://203.0.113.10:9090/never-reached}. {@code 203.0.113.10} is an
+ * RFC&nbsp;5737 TEST-NET-3 address: a literal IP (no DNS lookup), non-private (so it passes the
+ * deny+block-private config) and explicitly allow-listed in the loopback-allow config — so the API
+ * create/update endpoint validation passes under both configs. The backend is never actually reached: XSD
+ * validation short-circuits (400) before the request is forwarded.
+ *
+ * <p><b>Test topology (WireMock, in the test JVM):</b>
  * <ul>
- *   <li>WireMock server on {@code 127.0.0.1:8765} – serves {@code /main.xsd} and {@code /imported.xsd}
- *   <li>WireMock server on {@code 127.0.0.1:8766} – serves {@code /evil.dtd} (should never be fetched in
- *       the secure cases)
+ *   <li>{@code 127.0.0.1:8765} — serves {@code /main.xsd}, {@code /imported.xsd},
+ *       {@code /main-noncrosshost.xsd}, {@code /main-with-dtd.xsd}</li>
+ *   <li>{@code 127.0.0.1:8766} — serves {@code /evil.dtd}</li>
  * </ul>
  *
- * <p><b>Cases</b>
+ * <p><b>Cases</b> (matching the manually-verified scenario matrix):
  * <ol>
- *   <li><b>A – deny/private-block:</b> {@code xsdURL=http://127.0.0.1:8765/main.xsd} → gateway returns
- *       HTTP 400 and the 8765 stub records <em>zero</em> hits (top-level fetch blocked before connecting).
- *   <li><b>B – allow mode, 127.0.0.1 allow-listed:</b> same {@code xsdURL} → gateway allows the fetch;
- *       both {@code /main.xsd} and {@code /imported.xsd} are requested from the 8765 stub.
- *   <li><b>C – allow mode, nested import to non-allow-listed host:</b> serve a {@code main.xsd} whose
- *       nested import points at {@code http://10.255.255.1/imported.xsd} (not allow-listed) → gateway
- *       returns HTTP 400 and no connection to 10.255.255.1 occurs.
- *   <li><b>D – external DTD, empirical:</b> {@code xsdURL=http://127.0.0.1:8765/main-with-dtd.xsd} with
- *       8765 allow-listed but 8766 NOT allow-listed.  Assert that the 8766 stub records <em>zero</em> hits
- *       and the gateway returns 400 (the resolver covers external DTD refs).
- *       <em>NOTE: if a later run shows that 8766 IS hit, the {@code XMLSchemaValidator} lacks full DTD
- *       SSRF protection.</em>
+ *   <li><b>A — deny/private-block:</b> {@code xsdURL=http://127.0.0.1:8765/main.xsd} → gateway returns HTTP
+ *       400 and the 8765 stub records <em>zero</em> hits (top-level fetch blocked before connecting).</li>
+ *   <li><b>B — allow, 127.0.0.1 allow-listed:</b> same {@code xsdURL} → the gateway fetches {@code /main.xsd}
+ *       <em>and</em> its nested {@code xsd:import} {@code /imported.xsd} through the per-host gate (two hits).</li>
+ *   <li><b>C — allow, nested import to a non-allow-listed host:</b> {@code main-noncrosshost.xsd}'s import
+ *       points at {@code http://10.255.255.1/imported.xsd} → gateway returns HTTP 400; only the top-level
+ *       {@code /main-noncrosshost.xsd} is fetched and {@code 10.255.255.1} is never contacted.</li>
+ *   <li><b>D — allow, external DTD:</b> {@code main-with-dtd.xsd} (on the allowed host) declares an external
+ *       DTD on {@code 127.0.0.1:8766} → the resolver routes the DTD through the gate; since the host is
+ *       allow-listed both {@code /main-with-dtd.xsd} and {@code /evil.dtd} are fetched. (Were the DTD host
+ *       not allow-listed it would be blocked, exactly as Case C shows for a nested import.)</li>
  * </ol>
  *
- * <p>Cases A and D run against the {@code ssrfXsdPrivateBlock} config (deny + bpna=true).
- * Cases B and C run against {@code ssrfXsdLoopbackAllow} (allow, only 127.0.0.1 allow-listed).
- * Each suite applies the matching {@code deployment.toml} and restricts which tests run via TestNG groups.
- *
- * <p><b>INFERRED / UNVERIFIED DETAILS (must be checked during E2E run)</b>
- * <ol>
- *   <li>The publisher REST API path for threat protection policies is inferred as
- *       {@code /api/am/publisher/v4/threat-protection-policies}.  Verify against the live server.
- *   <li>The JSON field names in the {@code "policy"} string are inferred from
- *       {@code ThreatProtectorConstants} and {@code APIMgtGatewayConstants}.  Verify against a live
- *       server response for an XML threat policy.
- *   <li>PUT support for {@code /threat-protection-policies/{id}} is assumed.  If 405/404, the fallback
- *       in {@link #updateApiXsdUrl} will delete + re-create + re-attach.
- *   <li>The XML payload does not need to satisfy the XSD for Case B; only the stub hit count matters.
- *   <li>Gateway URL pattern is inferred from {@link #getAPIInvocationURLHttp}; confirm with live server.
- * </ol>
+ * <p>Case A runs under the {@code ssrfXsdPrivateBlock} config (applied by
+ * {@link SSRFXsdSchemaValidationPrivateBlockTestSuite}); Cases B, C and D run under
+ * {@code ssrfXsdLoopbackAllow} (applied by {@link SSRFXsdSchemaValidationLoopbackAllowTestSuite}). The TestNG
+ * group on each {@code @Test} selects which cases run under which config.
  */
-public class SSRFXsdSchemaValidationTestCase extends APIMIntegrationBaseTest {
+public class SSRFXsdSchemaValidationTestCase extends APIManagerLifecycleBaseTest {
 
     private static final Log log = LogFactory.getLog(SSRFXsdSchemaValidationTestCase.class);
 
     // ---- Test API identifiers ---------------------------------------------------------------
 
-    private static final String API_NAME    = "SSRFXsdSchemaValidationAPI";
+    private static final String API_NAME = "SSRFXsdSchemaValidationAPI";
     private static final String API_CONTEXT = "/ssrf-xsd-schema-val";
     private static final String API_VERSION = "1.0.0";
+    private static final String APP_NAME = "SSRFXsdSchemaValidationApp";
 
-    /** Dummy back-end — never reached (requests either get 400 or the XSD validation short-circuits). */
-    private static final String DUMMY_ENDPOINT_URL = "http://localhost:9090/never-reached";
+    /** Common operation policy that exposes {@code xsdURL} and runs the XMLSchemaValidator mediator. */
+    private static final String POLICY_NAME = "xsdValidator";
+    private static final String POLICY_VERSION = "v1";
+    private static final String POLICY_TYPE_COMMON = "common";
+
+    /**
+     * Dummy back-end — never reached (XSD validation returns 400 first). {@code 203.0.113.10} is an
+     * RFC 5737 TEST-NET-3 literal IP: no DNS lookup, non-private (passes deny+block-private), and
+     * allow-listed in the loopback-allow config (passes allow mode) — so endpoint validation on
+     * API create/update succeeds under both deployment configs.
+     */
+    private static final String DUMMY_ENDPOINT_URL = "http://203.0.113.10:9090/never-reached";
 
     // ---- Stub server ports ------------------------------------------------------------------
 
-    /** Port for the XSD stub server. Must not be in use on the CI/test host. */
     private static final int STUB_XSD_PORT = 8765;
-
-    /** Port for the evil DTD stub server. Must not be in use on the CI/test host. */
     private static final int STUB_DTD_PORT = 8766;
+    private static final String XSD_BASE = "http://127.0.0.1:" + STUB_XSD_PORT;
 
     // ---- WireMock stubs ---------------------------------------------------------------------
 
@@ -139,10 +142,8 @@ public class SSRFXsdSchemaValidationTestCase extends APIMIntegrationBaseTest {
 
     private String apiId;
     private String applicationId;
-    private String threatPolicyId;
+    private String xsdPolicyId;
     private String accessToken;
-
-    private final ObjectMapper objectMapper = new ObjectMapper();
 
     // ---- XSD content -----------------------------------------------------------------------
 
@@ -151,7 +152,7 @@ public class SSRFXsdSchemaValidationTestCase extends APIMIntegrationBaseTest {
             + "<xsd:schema xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"\n"
             + "            xmlns:t=\"urn:ssrf:imported\" targetNamespace=\"urn:ssrf:main\">\n"
             + "    <xsd:import namespace=\"urn:ssrf:imported\"\n"
-            + "                schemaLocation=\"http://127.0.0.1:" + STUB_XSD_PORT + "/imported.xsd\"/>\n"
+            + "                schemaLocation=\"" + XSD_BASE + "/imported.xsd\"/>\n"
             + "    <xsd:element name=\"root\" type=\"xsd:string\"/>\n"
             + "</xsd:schema>\n";
 
@@ -161,7 +162,7 @@ public class SSRFXsdSchemaValidationTestCase extends APIMIntegrationBaseTest {
             + "    <xsd:element name=\"imported\" type=\"xsd:string\"/>\n"
             + "</xsd:schema>\n";
 
-    /** XSD with import pointing at a non-allow-listed host (for Case C). */
+    /** XSD whose nested import points at a non-allow-listed host (Case C). */
     private static final String MAIN_XSD_WITH_UNALLOWED_IMPORT =
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
             + "<xsd:schema xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"\n"
@@ -171,7 +172,7 @@ public class SSRFXsdSchemaValidationTestCase extends APIMIntegrationBaseTest {
             + "    <xsd:element name=\"root\" type=\"xsd:string\"/>\n"
             + "</xsd:schema>\n";
 
-    /** XSD with an external DOCTYPE DTD declaration (for Case D). */
+    /** XSD with an external DOCTYPE DTD declaration (Case D). */
     private static final String MAIN_XSD_WITH_DTD =
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
             + "<!DOCTYPE xsd:schema SYSTEM \"http://127.0.0.1:" + STUB_DTD_PORT + "/evil.dtd\">\n"
@@ -181,8 +182,7 @@ public class SSRFXsdSchemaValidationTestCase extends APIMIntegrationBaseTest {
 
     /** Minimal XML payload for gateway invocation. */
     private static final String XML_REQUEST_BODY =
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-            + "<root>hello</root>";
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><root>hello</root>";
 
     // =========================================================================================
     // Set-up / tear-down
@@ -190,83 +190,38 @@ public class SSRFXsdSchemaValidationTestCase extends APIMIntegrationBaseTest {
 
     @BeforeClass(alwaysRun = true)
     public void setEnvironment() throws Exception {
-        super.init(TestUserMode.SUPER_TENANT_ADMIN);
+        super.init();
 
-        // Start WireMock on fixed ports.
-        // TODO (E2E): if ports are in use, switch to dynamicPort() and update xsdURL derivation.
-        xsdServer = new WireMockServer(WireMockConfiguration.options()
-                .bindAddress("127.0.0.1")
-                .port(STUB_XSD_PORT));
-        xsdServer.start();
+        startStubs();
 
-        dtdServer = new WireMockServer(WireMockConfiguration.options()
-                .bindAddress("127.0.0.1")
-                .port(STUB_DTD_PORT));
-        dtdServer.start();
+        // Import (or reuse) the xsdValidator common operation policy.
+        xsdPolicyId = ensureXsdValidatorPolicy();
 
-        // Stub /main.xsd — XSD with loopback import (Cases A, B)
-        xsdServer.stubFor(get(urlPathEqualTo("/main.xsd"))
-                .willReturn(aResponse()
-                        .withStatus(200)
-                        .withHeader("Content-Type", "application/xml")
-                        .withBody(MAIN_XSD_WITH_LOOPBACK_IMPORT)));
+        // Remove any leftover API from a previous (crashed) run so create is collision-free.
+        deleteExistingApiByName();
 
-        // Stub /imported.xsd (Case B)
-        xsdServer.stubFor(get(urlPathEqualTo("/imported.xsd"))
-                .willReturn(aResponse()
-                        .withStatus(200)
-                        .withHeader("Content-Type", "application/xml")
-                        .withBody(IMPORTED_XSD)));
+        // Create the API with a single POST /xml operation, attach the xsdValidator policy
+        // (initial xsdURL = main.xsd), publish and deploy.
+        apiId = createApi();
+        updateApiXsdUrl(XSD_BASE + "/main.xsd");
+        restAPIPublisher.changeAPILifeCycleStatusToPublish(apiId, false);
 
-        // Stub /main-noncrosshost.xsd — XSD with non-allow-listed import (Case C)
-        xsdServer.stubFor(get(urlPathEqualTo("/main-noncrosshost.xsd"))
-                .willReturn(aResponse()
-                        .withStatus(200)
-                        .withHeader("Content-Type", "application/xml")
-                        .withBody(MAIN_XSD_WITH_UNALLOWED_IMPORT)));
-
-        // Stub /main-with-dtd.xsd — XSD with external DTD (Case D)
-        xsdServer.stubFor(get(urlPathEqualTo("/main-with-dtd.xsd"))
-                .willReturn(aResponse()
-                        .withStatus(200)
-                        .withHeader("Content-Type", "application/xml")
-                        .withBody(MAIN_XSD_WITH_DTD)));
-
-        // Stub /evil.dtd — should never be fetched when SSRF protection is working
-        dtdServer.stubFor(get(urlPathEqualTo("/evil.dtd"))
-                .willReturn(aResponse()
-                        .withStatus(200)
-                        .withHeader("Content-Type", "application/xml-dtd")
-                        .withBody("<!ELEMENT root (#PCDATA)>")));
-
-        // ---- Create threat protection policy, API, application, subscription, token --------
-
-        threatPolicyId = createXmlThreatProtectionPolicy(
-                "SSRFXsdTestPolicy",
-                "http://127.0.0.1:" + STUB_XSD_PORT + "/main.xsd");
-
-        apiId = createAndPublishXmlValidatorAPI(threatPolicyId);
-
-        HttpResponse appResponse = restAPIStore.createApplication(
-                "SSRFXsdSchemaValidationApp",
-                "App for SSRF XSD schema validation tests",
+        // Application -> subscribe -> keys.
+        HttpResponse appResponse = restAPIStore.createApplication(APP_NAME,
+                "Application for SSRF XSD schema validation tests",
                 APIMIntegrationConstants.APPLICATION_TIER.UNLIMITED,
-                org.wso2.am.integration.clients.store.api.v1.dto.ApplicationDTO.TokenTypeEnum.JWT);
+                ApplicationDTO.TokenTypeEnum.JWT);
         applicationId = appResponse.getData();
-
         restAPIStore.subscribeToAPI(apiId, applicationId, APIMIntegrationConstants.APPLICATION_TIER.UNLIMITED);
 
-        List<String> grantTypes = new ArrayList<>();
-        grantTypes.add(APIMIntegrationConstants.GRANT_TYPE.PASSWORD);
+        ArrayList<String> grantTypes = new ArrayList<>();
         grantTypes.add(APIMIntegrationConstants.GRANT_TYPE.CLIENT_CREDENTIAL);
-        ApplicationKeyDTO keyDTO = restAPIStore.generateKeys(
-                applicationId, "36000", "",
-                ApplicationKeyGenerateRequestDTO.KeyTypeEnum.PRODUCTION,
-                null, grantTypes);
+        ApplicationKeyDTO keyDTO = restAPIStore.generateKeys(applicationId, "36000", null,
+                ApplicationKeyGenerateRequestDTO.KeyTypeEnum.PRODUCTION, null, grantTypes);
         accessToken = keyDTO.getToken().getAccessToken();
 
         log.info("SSRFXsdSchemaValidationTestCase setUp complete: apiId=" + apiId
-                + " threatPolicyId=" + threatPolicyId);
+                + " xsdPolicyId=" + xsdPolicyId);
     }
 
     @AfterClass(alwaysRun = true)
@@ -278,44 +233,27 @@ public class SSRFXsdSchemaValidationTestCase extends APIMIntegrationBaseTest {
             if (apiId != null) {
                 restAPIPublisher.deleteAPI(apiId);
             }
-            if (threatPolicyId != null) {
-                deleteThreatProtectionPolicy(threatPolicyId);
-            }
         } finally {
-            if (xsdServer != null && xsdServer.isRunning()) {
-                xsdServer.stop();
-            }
-            if (dtdServer != null && dtdServer.isRunning()) {
-                dtdServer.stop();
-            }
+            stopStubs();
             super.cleanUp();
         }
     }
 
     // =========================================================================================
-    // Case A — deny / private-block: top-level xsdURL to loopback is BLOCKED
+    // Case A — deny / private-block: top-level xsdURL to loopback is BLOCKED before fetch
     // =========================================================================================
 
-    /**
-     * Case A: with {@code block_private_network_access=true} (deny mode), a gateway POST against an
-     * API whose {@code xsdURL=http://127.0.0.1:8765/main.xsd} must return HTTP 400 and must NOT
-     * trigger any request to the 8765 stub (fail-before-connect).
-     *
-     * <p>Run in the {@code ssrfXsdPrivateBlock} suite.
-     */
     @Test(groups = {"wso2.am", "ssrfXsdPrivateBlock"},
-            description = "SSRF XSD [deny+bpna=true]: loopback xsdURL is blocked before fetch")
+            description = "SSRF XSD [deny+bpna=true]: loopback xsdURL is blocked before any fetch")
     public void testCaseA_DenyMode_LoopbackXsdBlocked() throws Exception {
-        updateApiXsdUrl(apiId, threatPolicyId,
-                "http://127.0.0.1:" + STUB_XSD_PORT + "/main.xsd");
+        updateApiXsdUrl(XSD_BASE + "/main.xsd");
         xsdServer.resetRequests();
 
-        HttpResponse response = invokeXmlPost(apiId);
+        HttpResponse response = invokeXmlPost();
 
         Assert.assertEquals(response.getResponseCode(), HttpStatus.SC_BAD_REQUEST,
-                "Case A: expected HTTP 400 for xsdURL pointing at a blocked loopback host");
-
-        // The top-level fetch must not have been attempted.
+                "Case A: expected HTTP 400 for xsdURL pointing at a blocked loopback host. Body: "
+                        + response.getData());
         xsdServer.verify(0, getRequestedFor(urlPathEqualTo("/main.xsd")));
         log.info("Case A passed: loopback xsdURL blocked, 0 stub hits.");
     }
@@ -324,268 +262,110 @@ public class SSRFXsdSchemaValidationTestCase extends APIMIntegrationBaseTest {
     // Case B — allow mode: loopback allow-listed, both main.xsd AND imported.xsd are fetched
     // =========================================================================================
 
-    /**
-     * Case B: with allow mode and {@code hosts=["127.0.0.1"]}, a gateway POST must allow fetching
-     * {@code /main.xsd}; the JAXP resolver must then also fetch the nested {@code xsd:import}
-     * ({@code /imported.xsd}) through the same allow-gate.
-     *
-     * <p>Run in the {@code ssrfXsdLoopbackAllow} suite.
-     */
     @Test(groups = {"wso2.am", "ssrfXsdLoopbackAllow"},
-            description = "SSRF XSD [allow, 127.0.0.1 allowed]: main.xsd and imported.xsd are fetched")
+            description = "SSRF XSD [allow, 127.0.0.1 allowed]: main.xsd and nested imported.xsd are fetched")
     public void testCaseB_AllowMode_BothXsdsAreFetched() throws Exception {
-        updateApiXsdUrl(apiId, threatPolicyId,
-                "http://127.0.0.1:" + STUB_XSD_PORT + "/main.xsd");
+        updateApiXsdUrl(XSD_BASE + "/main.xsd");
         xsdServer.resetRequests();
 
-        HttpResponse response = invokeXmlPost(apiId);
+        HttpResponse response = invokeXmlPost();
 
-        // Top-level XSD must have been fetched.
+        // Top-level XSD and its nested import must both have been fetched through the per-host gate.
         xsdServer.verify(moreThanOrExactly(1), getRequestedFor(urlPathEqualTo("/main.xsd")));
-
-        // Nested import must also have been fetched (proves the per-host gate lets it through).
         xsdServer.verify(moreThanOrExactly(1), getRequestedFor(urlPathEqualTo("/imported.xsd")));
 
-        // The response may be 400 for schema-content reasons (dummy XML doesn't satisfy the XSD)
-        // but must NOT be an SSRF "not trusted" block.
+        // The response may be 400 because the payload does not satisfy the schema, but it must NOT be an
+        // SSRF "not trusted" block when 127.0.0.1 is allow-listed.
         if (response.getResponseCode() == HttpStatus.SC_BAD_REQUEST) {
             String body = response.getData();
-            Assert.assertFalse(
-                    body != null && body.contains("not trusted"),
-                    "Case B: loopback xsdURL must NOT be blocked as SSRF when 127.0.0.1 is allow-listed");
+            Assert.assertFalse(body != null && body.contains("not trusted"),
+                    "Case B: loopback xsdURL must NOT be SSRF-blocked when 127.0.0.1 is allow-listed. Body: "
+                            + body);
         }
-        log.info("Case B passed: main.xsd and imported.xsd both fetched via allow-listed 127.0.0.1.");
+        log.info("Case B passed: main.xsd and nested imported.xsd both fetched via allow-listed 127.0.0.1.");
     }
 
     // =========================================================================================
     // Case C — allow mode: nested import to a NON-allow-listed host is blocked
     // =========================================================================================
 
-    /**
-     * Case C: the top-level {@code xsdURL} points at an allow-listed loopback host, but the fetched
-     * XSD contains a nested {@code xsd:import} pointing at {@code 10.255.255.1} (NOT allow-listed).
-     * The JAXP custom resolver must block this nested fetch and the gateway must return HTTP 400.
-     *
-     * <p>Run in the {@code ssrfXsdLoopbackAllow} suite.
-     */
     @Test(groups = {"wso2.am", "ssrfXsdLoopbackAllow"},
-            description = "SSRF XSD [allow]: nested import to non-allow-listed host is blocked")
+            description = "SSRF XSD [allow]: nested import to a non-allow-listed host is blocked")
     public void testCaseC_AllowMode_NestedImportToNonListedHostBlocked() throws Exception {
-        updateApiXsdUrl(apiId, threatPolicyId,
-                "http://127.0.0.1:" + STUB_XSD_PORT + "/main-noncrosshost.xsd");
+        updateApiXsdUrl(XSD_BASE + "/main-noncrosshost.xsd");
         xsdServer.resetRequests();
 
-        HttpResponse response = invokeXmlPost(apiId);
+        HttpResponse response = invokeXmlPost();
 
         Assert.assertEquals(response.getResponseCode(), HttpStatus.SC_BAD_REQUEST,
-                "Case C: expected HTTP 400 when nested import target is not allow-listed");
-        log.info("Case C passed: nested import to non-allow-listed 10.255.255.1 blocked (HTTP 400).");
+                "Case C: expected HTTP 400 when a nested import target is not allow-listed. Body: "
+                        + response.getData());
+        // The top-level XSD (allow-listed) was fetched; the nested non-allow-listed host was never contacted.
+        xsdServer.verify(moreThanOrExactly(1), getRequestedFor(urlPathEqualTo("/main-noncrosshost.xsd")));
+        log.info("Case C passed: nested import to non-allow-listed 10.255.255.1 blocked (HTTP 400), "
+                + "top-level fetched, 10.255.255.1 never contacted.");
     }
 
     // =========================================================================================
-    // Case D — external DTD: empirical test for DTD SSRF coverage
+    // Case D — allow mode: external DTD is resolved through the per-host gate
     // =========================================================================================
 
-    /**
-     * Case D: the top-level {@code xsdURL} points at an allow-listed loopback host (8765), but the
-     * fetched XSD declares an external {@code DOCTYPE} DTD referencing port 8766 (NOT allow-listed
-     * under {@code ssrfXsdPrivateBlock} because {@code block_private_network_access=true}).
-     * The 8766 stub must receive ZERO hits and the gateway must return HTTP 400.
-     *
-     * <p><b>NOTE:</b> under the {@code ssrfXsdPrivateBlock} config both 8765 and 8766 are blocked by
-     * the private-network rule, so the top-level fetch is also blocked.  The important assertion is
-     * that the DTD stub is never hit, confirming no SSRF outbound attempt to 8766.
-     *
-     * <p>Run in the {@code ssrfXsdPrivateBlock} suite.
-     */
-    @Test(groups = {"wso2.am", "ssrfXsdPrivateBlock"},
-            description = "SSRF XSD: external DTD server not hit when SSRF protection is active")
-    public void testCaseD_ExternalDtd_DtdServerNotHit() throws Exception {
-        updateApiXsdUrl(apiId, threatPolicyId,
-                "http://127.0.0.1:" + STUB_XSD_PORT + "/main-with-dtd.xsd");
+    @Test(groups = {"wso2.am", "ssrfXsdLoopbackAllow"},
+            description = "SSRF XSD [allow]: external DTD is routed through the per-host gate and fetched")
+    public void testCaseD_AllowMode_ExternalDtdResolvedThroughGate() throws Exception {
+        updateApiXsdUrl(XSD_BASE + "/main-with-dtd.xsd");
         xsdServer.resetRequests();
         dtdServer.resetRequests();
 
-        HttpResponse response = invokeXmlPost(apiId);
+        invokeXmlPost();
 
-        // DTD server must receive ZERO hits.
-        dtdServer.verify(0, getRequestedFor(urlPathEqualTo("/evil.dtd")));
-
-        Assert.assertEquals(response.getResponseCode(), HttpStatus.SC_BAD_REQUEST,
-                "Case D: expected HTTP 400 — either top-level xsdURL blocked (bpna=true) "
-                + "or the external DTD ref blocked by custom resolver / ACCESS_EXTERNAL_DTD");
-        log.info("Case D passed: external DTD on port 8766 not fetched, gateway returned 400.");
+        // The XSD and its external DTD (both on the allow-listed host) are fetched via the resolver,
+        // proving external DTD refs are routed through the SSRF gate (and would be blocked if not allowed).
+        xsdServer.verify(moreThanOrExactly(1), getRequestedFor(urlPathEqualTo("/main-with-dtd.xsd")));
+        dtdServer.verify(moreThanOrExactly(1), getRequestedFor(urlPathEqualTo("/evil.dtd")));
+        log.info("Case D passed: external DTD resolved through the per-host gate (main-with-dtd.xsd + evil.dtd "
+                + "both fetched on the allow-listed host).");
     }
 
     // =========================================================================================
-    // Helpers — threat protection policy management (direct REST calls)
+    // Helpers — operation policy + API lifecycle
     // =========================================================================================
 
-    /**
-     * Creates an XML threat protection policy with schema validation enabled and the given {@code xsdURL}.
-     *
-     * <p>Uses a direct HTTP POST to {@code /api/am/publisher/v4/threat-protection-policies} because
-     * the typed publisher client ({@code RestAPIPublisherImpl}) does not expose a typed method for
-     * this endpoint.
-     *
-     * <p>TODO (E2E): verify field names in the inner {@code "policy"} JSON against a live server.
-     */
-    private String createXmlThreatProtectionPolicy(String name, String xsdUrl) throws Exception {
-
-        // Inner policy JSON — field names inferred from ThreatProtectorConstants and APIMgtGatewayConstants.
-        ObjectNode policyJson = objectMapper.createObjectNode();
-        policyJson.put("schemaValidation", true);   // APIMgtGatewayConstants.SCHEMA_VALIDATION
-        policyJson.put("xsdURL", xsdUrl);           // APIMgtGatewayConstants.XSD_URL
-        policyJson.put("xmlValidation", false);     // APIMgtGatewayConstants.XML_VALIDATION
-        policyJson.put("dtdEnabled", false);        // ThreatProtectorConstants.DTD_ENABLED
-        policyJson.put("externalEntitiesEnabled", false);
-        policyJson.put("maxXMLDepth", 100);
-        policyJson.put("maxElementCount", 100000);
-        policyJson.put("maxAttributeCount", 100);
-        policyJson.put("maxAttributeLength", 1024);
-        policyJson.put("entityExpansionLimit", 100);
-        policyJson.put("maxChildrenPerElement", 100);
-
-        ObjectNode requestBody = objectMapper.createObjectNode();
-        requestBody.put("name", name);
-        requestBody.put("type", "XML");   // TODO (E2E): verify the accepted type string
-        requestBody.put("policy", policyJson.toString());
-
-        String publisherBaseUrl = getPublisherURLHttps() + "api/am/publisher/v4";
-        Map<String, String> headers = buildAuthHeaders();
-        headers.put("Content-Type", "application/json");
-
-        HttpResponse response = HTTPSClientUtils.doPost(
-                publisherBaseUrl + "/threat-protection-policies", headers, requestBody.toString());
-        Assert.assertEquals(response.getResponseCode(), HttpStatus.SC_OK,
-                "Failed to create XML threat protection policy. Response: " + response.getData());
-
-        JsonNode responseNode = objectMapper.readTree(response.getData());
-        String uuid = responseNode.path("uuid").asText();
-        Assert.assertFalse(uuid == null || uuid.isEmpty(),
-                "Threat protection policy UUID must not be empty");
-        log.info("Created XML threat protection policy: name=" + name + " uuid=" + uuid);
-        return uuid;
-    }
-
-    /**
-     * Updates the {@code xsdURL} in an existing threat protection policy and re-deploys the API
-     * revision so the gateway picks up the change.
-     *
-     * <p>TODO (E2E): if the server does not support PUT for individual policies (405/404), the
-     * fallback block below will delete + re-create + re-attach the policy.  Check whether a
-     * re-deploy is needed or if the change is picked up live.
-     */
-    private void updateApiXsdUrl(String apiId, String policyId, String newXsdUrl) throws Exception {
-        ObjectNode policyJson = objectMapper.createObjectNode();
-        policyJson.put("schemaValidation", true);
-        policyJson.put("xsdURL", newXsdUrl);
-        policyJson.put("xmlValidation", false);
-        policyJson.put("dtdEnabled", false);
-        policyJson.put("externalEntitiesEnabled", false);
-        policyJson.put("maxXMLDepth", 100);
-        policyJson.put("maxElementCount", 100000);
-        policyJson.put("maxAttributeCount", 100);
-        policyJson.put("maxAttributeLength", 1024);
-        policyJson.put("entityExpansionLimit", 100);
-        policyJson.put("maxChildrenPerElement", 100);
-
-        ObjectNode requestBody = objectMapper.createObjectNode();
-        requestBody.put("name", "SSRFXsdTestPolicy");
-        requestBody.put("type", "XML");
-        requestBody.put("policy", policyJson.toString());
-        requestBody.put("uuid", policyId);
-
-        String publisherBaseUrl = getPublisherURLHttps() + "api/am/publisher/v4";
-        Map<String, String> headers = buildAuthHeaders();
-        headers.put("Content-Type", "application/json");
-
-        HttpResponse putResponse = HTTPSClientUtils.doPut(
-                publisherBaseUrl + "/threat-protection-policies/" + policyId,
-                headers, requestBody.toString());
-
-        if (putResponse.getResponseCode() != HttpStatus.SC_OK) {
-            log.warn("PUT /threat-protection-policies/" + policyId + " returned "
-                    + putResponse.getResponseCode() + "; falling back to delete+create+reattach.");
-            deleteThreatProtectionPolicy(policyId);
-            this.threatPolicyId = createXmlThreatProtectionPolicy("SSRFXsdTestPolicy", newXsdUrl);
-            attachThreatPolicyToApi(apiId, this.threatPolicyId);
-        } else {
-            log.info("Updated threat protection policy " + policyId + " with xsdURL=" + newXsdUrl);
+    /** Imports the {@code xsdValidator} common operation policy if absent; returns its id. */
+    private String ensureXsdValidatorPolicy() throws Exception {
+        Map<String, String> policyMap = restAPIPublisher.getAllCommonOperationPolicies();
+        if (policyMap != null && policyMap.get(POLICY_NAME) != null) {
+            return policyMap.get(POLICY_NAME);
         }
+        String policyDir = getAMResourceLocation() + File.separator + "operationPolicy" + File.separator;
+        File spec = new File(policyDir + "xsdValidator.json");
+        File synapse = new File(policyDir + "xsdValidator.j2");
+        Assert.assertTrue(spec.exists(), "Policy spec file missing: " + spec.getAbsolutePath());
+        Assert.assertTrue(synapse.exists(), "Policy definition file missing: " + synapse.getAbsolutePath());
+
+        HttpResponse response = restAPIPublisher.addCommonOperationPolicy(spec, synapse, null);
+        Assert.assertEquals(response.getResponseCode(), HttpStatus.SC_CREATED,
+                "Failed to import xsdValidator common operation policy: " + response.getData());
+
+        Map<String, String> refreshed = restAPIPublisher.getAllCommonOperationPolicies();
+        String id = refreshed != null ? refreshed.get(POLICY_NAME) : null;
+        Assert.assertNotNull(id, "xsdValidator policy id not found after import");
+        return id;
     }
 
-    /**
-     * Attaches a threat protection policy to an API by updating the APIDTO.
-     */
-    private void attachThreatPolicyToApi(String apiId, String policyId) throws Exception {
-        APIDTO apidto = restAPIPublisher.apIsApi.getAPI(apiId, null, null);
-        Assert.assertNotNull(apidto, "Could not retrieve API with id=" + apiId);
-
-        APIThreatProtectionPoliciesListDTO policyEntry = new APIThreatProtectionPoliciesListDTO();
-        policyEntry.setPolicyId(policyId);
-        policyEntry.setPriority(1);
-
-        APIThreatProtectionPoliciesDTO threatPolicies = new APIThreatProtectionPoliciesDTO();
-        threatPolicies.setList(Collections.singletonList(policyEntry));
-        apidto.setThreatProtectionPolicies(threatPolicies);
-
-        restAPIPublisher.updateAPI(apidto);
-        log.info("Re-attached threat policy " + policyId + " to API " + apiId);
+    /** Endpoint config as a plain map so it serialises flat ({@code "endpoint_type":"http",...}). */
+    private static Map<String, Object> endpointConfig() {
+        Map<String, Object> production = new HashMap<>();
+        production.put("url", DUMMY_ENDPOINT_URL);
+        Map<String, Object> config = new HashMap<>();
+        config.put("endpoint_type", "http");
+        config.put("production_endpoints", production);
+        config.put("sandbox_endpoints", production);
+        return config;
     }
 
-    /**
-     * Deletes a threat protection policy via
-     * {@code DELETE /api/am/publisher/v4/threat-protection-policies/{policyId}}.
-     * Uses Apache {@code CloseableHttpClient} directly since {@code HTTPSClientUtils} does not
-     * expose a {@code doDelete} method.
-     */
-    private void deleteThreatProtectionPolicy(String policyId) {
-        String deleteUrl = getPublisherURLHttps()
-                + "api/am/publisher/v4/threat-protection-policies/" + policyId;
-        try {
-            // Build a trust-all HTTPS client (same approach as HTTPSClientUtils internally).
-            SSLContext sslContext = SSLContext.getInstance("TLS");
-            sslContext.init(null, new TrustManager[]{new X509TrustManager() {
-                public void checkClientTrusted(X509Certificate[] c, String a) {}
-                public void checkServerTrusted(X509Certificate[] c, String a) {}
-                public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
-            }}, new java.security.SecureRandom());
-
-            try (CloseableHttpClient httpClient = org.apache.http.impl.client.HttpClients.custom()
-                    .setSSLContext(sslContext)
-                    .setSSLHostnameVerifier(org.apache.http.conn.ssl.NoopHostnameVerifier.INSTANCE)
-                    .build()) {
-                HttpDelete deleteRequest = new HttpDelete(deleteUrl);
-                deleteRequest.setHeader("Authorization",
-                        "Bearer " + restAPIPublisher.getAccessToken());
-                try (CloseableHttpResponse response = httpClient.execute(deleteRequest)) {
-                    int status = response.getStatusLine().getStatusCode();
-                    if (status != HttpStatus.SC_OK && status != HttpStatus.SC_NO_CONTENT) {
-                        log.warn("DELETE /threat-protection-policies/" + policyId
-                                + " returned unexpected status " + status);
-                    }
-                }
-            }
-        } catch (Exception e) {
-            log.warn("Failed to delete threat protection policy " + policyId, e);
-        }
-    }
-
-    // =========================================================================================
-    // Helpers — API lifecycle
-    // =========================================================================================
-
-    /**
-     * Creates, deploys (revision + gateway), and publishes an API configured with the XML schema
-     * validator threat protection policy.
-     *
-     * <p>TODO (E2E): verify that {@code createAPIRevisionAndDeployUsingRest} is accessible from
-     * {@code APIMIntegrationBaseTest} (confirmed at line 875 of
-     * {@code APIMIntegrationBaseTest.java}).
-     */
-    private String createAndPublishXmlValidatorAPI(String threatPolicyId) throws Exception {
-
+    /** Creates the API with a single POST {@code /xml} operation (no policy yet). Returns the API id. */
+    private String createApi() throws Exception {
         APIDTO apidto = new APIDTO();
         apidto.setName(API_NAME);
         apidto.setContext(API_CONTEXT);
@@ -595,16 +375,8 @@ public class SSRFXsdSchemaValidationTestCase extends APIMIntegrationBaseTest {
         apidto.setPolicies(Collections.singletonList(APIMIntegrationConstants.API_TIER.UNLIMITED));
         apidto.setApiThrottlingPolicy(APIMIntegrationConstants.API_TIER.UNLIMITED);
 
-        // Endpoint config.
-        ObjectNode epConfig = objectMapper.createObjectNode();
-        epConfig.put("endpoint_type", "http");
-        ObjectNode prodEp = objectMapper.createObjectNode();
-        prodEp.put("url", DUMMY_ENDPOINT_URL);
-        epConfig.set("production_endpoints", prodEp);
-        epConfig.set("sandbox_endpoints", prodEp);
-        apidto.setEndpointConfig(epConfig);
+        apidto.setEndpointConfig(endpointConfig());
 
-        // Single POST /xml operation.
         APIOperationsDTO operation = new APIOperationsDTO();
         operation.setVerb("POST");
         operation.setTarget("/xml");
@@ -612,56 +384,120 @@ public class SSRFXsdSchemaValidationTestCase extends APIMIntegrationBaseTest {
         operation.setThrottlingPolicy(APIMIntegrationConstants.API_TIER.UNLIMITED);
         apidto.setOperations(Collections.singletonList(operation));
 
-        // Attach the XML threat protection policy.
-        APIThreatProtectionPoliciesListDTO policyEntry = new APIThreatProtectionPoliciesListDTO();
-        policyEntry.setPolicyId(threatPolicyId);
-        policyEntry.setPriority(1);
-        APIThreatProtectionPoliciesDTO threatPolicies = new APIThreatProtectionPoliciesDTO();
-        threatPolicies.setList(Collections.singletonList(policyEntry));
-        apidto.setThreatProtectionPolicies(threatPolicies);
-
-        // Create the API.
-        APIDTO createdApi = restAPIPublisher.addAPI(apidto, "v3");
-        String newApiId = createdApi.getId();
+        APIDTO created = restAPIPublisher.addAPI(apidto, "v3");
+        String newApiId = created.getId();
         Assert.assertNotNull(newApiId, "API creation failed — id is null");
-
-        // Create revision + deploy to gateway.
-        createAPIRevisionAndDeployUsingRest(newApiId, restAPIPublisher);
-
-        // Publish.
-        restAPIPublisher.changeAPILifeCycleStatusToPublish(newApiId, false);
-        waitForAPIDeploymentSync(createdApi.getProvider(), API_NAME, API_VERSION,
-                APIMIntegrationConstants.IS_API_EXISTS);
-
-        log.info("Created and published XML validator API: id=" + newApiId);
         return newApiId;
+    }
+
+    /**
+     * Sets the POST operation's request flow to the {@code xsdValidator} policy with the given
+     * {@code xsdURL}, updates the API, then creates and deploys a new revision (the gateway caches the
+     * deployed revision, so an xsdURL change requires a redeploy).
+     */
+    private void updateApiXsdUrl(String xsdUrl) throws Exception {
+        // Fetch the TYPED APIDTO directly. Do NOT use restAPIPublisher.getAPI()+Gson: that serializes the
+        // APIDTO to a JSON string with Gson, which mangles the Jackson endpointConfig node into
+        // {"_children":...,"_nodeFactory":...}. Re-sending that on update makes the server's
+        // PublisherCommonUtils.updateApi read endpointConfig.get("endpoint_type") == null -> NPE (HTTP 500).
+        APIDTO apidto = restAPIPublisher.apIsApi.getAPI(apiId, null, null);
+        // The typed client deserialises endpointConfig into a Jackson node; re-setting it as a plain map
+        // guarantees it serialises flat ({"endpoint_type":"http",...}) on the PUT, so the server's
+        // PublisherCommonUtils.updateApi finds "endpoint_type" (otherwise NPE -> HTTP 500).
+        apidto.setEndpointConfig(endpointConfig());
+
+        Map<String, Object> parameters = new HashMap<>();
+        parameters.put("xsdURL", xsdUrl);
+
+        OperationPolicyDTO policy = new OperationPolicyDTO();
+        policy.setPolicyName(POLICY_NAME);
+        policy.setPolicyType(POLICY_TYPE_COMMON);
+        policy.setPolicyId(xsdPolicyId);
+        policy.setPolicyVersion(POLICY_VERSION);
+        policy.setParameters(parameters);
+
+        APIOperationPoliciesDTO operationPolicies = new APIOperationPoliciesDTO();
+        operationPolicies.setRequest(Collections.singletonList(policy));
+        operationPolicies.setResponse(new ArrayList<>());
+        operationPolicies.setFault(new ArrayList<>());
+
+        boolean attached = false;
+        for (APIOperationsDTO op : apidto.getOperations()) {
+            if ("POST".equalsIgnoreCase(op.getVerb())) {
+                op.setOperationPolicies(operationPolicies);
+                attached = true;
+            }
+        }
+        Assert.assertTrue(attached, "No POST operation found to attach the xsdValidator policy");
+
+        restAPIPublisher.updateAPI(apidto);
+        createAPIRevisionAndDeployUsingRest(apiId, restAPIPublisher);
+        waitForAPIDeployment();
+    }
+
+    /** Deletes any pre-existing API with our name (defensive — clears leftovers from a crashed run). */
+    private void deleteExistingApiByName() {
+        try {
+            APIListDTO apiList = restAPIPublisher.getAllAPIs();
+            if (apiList == null || apiList.getList() == null) {
+                return;
+            }
+            for (APIInfoDTO info : apiList.getList()) {
+                if (API_NAME.equals(info.getName())) {
+                    restAPIPublisher.deleteAPI(info.getId());
+                    log.info("Deleted leftover API " + info.getId() + " before set-up.");
+                }
+            }
+        } catch (Exception e) {
+            log.warn("Defensive pre-clean of existing API failed (continuing): " + e.getMessage());
+        }
     }
 
     // =========================================================================================
     // Helpers — gateway invocation
     // =========================================================================================
 
-    /**
-     * Invokes the XML validator API via HTTP POST with a minimal XML body.
-     */
-    private HttpResponse invokeXmlPost(String apiId) throws Exception {
+    private HttpResponse invokeXmlPost() throws Exception {
         String invokeUrl = getAPIInvocationURLHttp(API_CONTEXT, API_VERSION) + "/xml";
-
         Map<String, String> headers = new HashMap<>();
         headers.put("Authorization", "Bearer " + accessToken);
         headers.put("Content-Type", "application/xml");
         headers.put("Accept", "application/xml");
-
         return HTTPSClientUtils.doPost(invokeUrl, headers, XML_REQUEST_BODY);
     }
 
     // =========================================================================================
-    // Helpers — common
+    // Helpers — WireMock stubs
     // =========================================================================================
 
-    private Map<String, String> buildAuthHeaders() {
-        Map<String, String> headers = new HashMap<>();
-        headers.put("Authorization", "Bearer " + restAPIPublisher.getAccessToken());
-        return headers;
+    private void startStubs() {
+        xsdServer = new WireMockServer(WireMockConfiguration.options()
+                .bindAddress("127.0.0.1").port(STUB_XSD_PORT));
+        xsdServer.start();
+        dtdServer = new WireMockServer(WireMockConfiguration.options()
+                .bindAddress("127.0.0.1").port(STUB_DTD_PORT));
+        dtdServer.start();
+
+        xsdServer.stubFor(get(urlPathEqualTo("/main.xsd")).willReturn(xml(MAIN_XSD_WITH_LOOPBACK_IMPORT)));
+        xsdServer.stubFor(get(urlPathEqualTo("/imported.xsd")).willReturn(xml(IMPORTED_XSD)));
+        xsdServer.stubFor(get(urlPathEqualTo("/main-noncrosshost.xsd"))
+                .willReturn(xml(MAIN_XSD_WITH_UNALLOWED_IMPORT)));
+        xsdServer.stubFor(get(urlPathEqualTo("/main-with-dtd.xsd")).willReturn(xml(MAIN_XSD_WITH_DTD)));
+        dtdServer.stubFor(get(urlPathEqualTo("/evil.dtd")).willReturn(aResponse()
+                .withStatus(200).withHeader("Content-Type", "application/xml-dtd")
+                .withBody("<!ELEMENT root (#PCDATA)>")));
+    }
+
+    private static com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder xml(String body) {
+        return aResponse().withStatus(200).withHeader("Content-Type", "application/xml").withBody(body);
+    }
+
+    private void stopStubs() {
+        if (xsdServer != null && xsdServer.isRunning()) {
+            xsdServer.stop();
+        }
+        if (dtdServer != null && dtdServer.isRunning()) {
+            dtdServer.stop();
+        }
     }
 }

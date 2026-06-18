@@ -1,0 +1,26 @@
+{
+  "category": "Mediation",
+  "name": "xsdValidator",
+  "version": "v1",
+  "displayName": "XSD Validator (SSRF test)",
+  "description": "Validates the XML request body against an XSD fetched from a configurable xsdURL. Unlike the stock xmlValidator policy, this exposes xsdURL as a parameter and turns schemaValidation on, so the gateway XMLSchemaValidator mediator fetches the given XSD (and any nested import/include/DTD) through the network access-control SSRF gate.",
+  "applicableFlows": [
+    "request"
+  ],
+  "supportedGateways": [
+    "Synapse"
+  ],
+  "supportedApiTypes": [
+    "HTTP"
+  ],
+  "policyAttributes": [
+    {
+      "name": "xsdURL",
+      "displayName": "XSD URL",
+      "description": "URL of the XSD to validate the request body against (the SSRF gate is applied to this URL and to any nested import/include/DTD inside it).",
+      "validationRegex": "^.{1,1024}$",
+      "type": "String",
+      "required": true
+    }
+  ]
+}

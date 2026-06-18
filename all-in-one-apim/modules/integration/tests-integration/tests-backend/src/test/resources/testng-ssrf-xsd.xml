@@ -1,0 +1,58 @@
+<!DOCTYPE suite SYSTEM "http://testng.org/testng-1.0.dtd" >
+
+<!--
+  Focused suite for running ONLY the SSRF xsdURL schema-validation integration tests against a
+  freshly provisioned server (the engine listeners + automation.xml + APIMCarbonServerExtension
+  start the server from carbon.zip). Run with:
+    mvn -pl <tests-backend> test -DskipIntegrationTests=false \
+        -Dsurefire.suiteXmlFiles=src/test/resources/testng-ssrf-xsd.xml
+-->
+<suite name="apim-ssrf-xsd-suite" parallel="false">
+    <parameter name="useDefaultListeners" value="false"/>
+
+    <listeners>
+        <listener class-name="org.wso2.carbon.automation.engine.testlisteners.TestExecutionListener"/>
+        <listener class-name="org.wso2.carbon.automation.engine.testlisteners.TestManagerListener"/>
+        <listener class-name="org.wso2.carbon.automation.engine.testlisteners.TestReportListener"/>
+        <listener class-name="org.wso2.carbon.automation.engine.testlisteners.TestSuiteListener"/>
+        <listener class-name="org.wso2.carbon.automation.engine.testlisteners.TestTransformerListener"/>
+        <listener class-name="org.wso2.am.integration.tests.listener.APIMAlterSuiteListener"/>
+        <listener class-name="org.wso2.am.integration.tests.listener.APIMTestExecutionListener"/>
+    </listeners>
+
+    <test name="apim-ssrf-xsd-warmup" preserve-order="true" parallel="false">
+        <groups>
+            <run>
+                <include name="ssrfXsdWarmup"/>
+            </run>
+        </groups>
+        <classes>
+            <class name="org.wso2.am.integration.tests.other.SSRFXsdScopedRunWarmupTestCase"/>
+        </classes>
+    </test>
+
+    <test name="apim-ssrf-xsd-privateblock-tests" preserve-order="true" parallel="false" group-by-instances="true">
+        <groups>
+            <run>
+                <include name="ssrfXsdPrivateBlock"/>
+            </run>
+        </groups>
+        <classes>
+            <class name="org.wso2.am.integration.tests.other.SSRFXsdSchemaValidationPrivateBlockTestSuite"/>
+            <class name="org.wso2.am.integration.tests.other.SSRFXsdSchemaValidationTestCase"/>
+        </classes>
+    </test>
+
+    <test name="apim-ssrf-xsd-loopback-allow-tests" preserve-order="true" parallel="false" group-by-instances="true">
+        <groups>
+            <run>
+                <include name="ssrfXsdLoopbackAllow"/>
+            </run>
+        </groups>
+        <classes>
+            <class name="org.wso2.am.integration.tests.other.SSRFXsdSchemaValidationLoopbackAllowTestSuite"/>
+            <class name="org.wso2.am.integration.tests.other.SSRFXsdSchemaValidationTestCase"/>
+        </classes>
+    </test>
+
+</suite>

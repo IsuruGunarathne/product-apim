@@ -486,6 +486,32 @@
         </classes>
     </test>
 
+    <test name="apim-ssrf-xsd-privateblock-tests" preserve-order="true" parallel="false" group-by-instances="true">
+        <parameter name="group" value="group2"/>
+        <groups>
+            <run>
+                <include name="ssrfXsdPrivateBlock"/>
+            </run>
+        </groups>
+        <classes>
+            <class name="org.wso2.am.integration.tests.other.SSRFXsdSchemaValidationPrivateBlockTestSuite"/>
+            <class name="org.wso2.am.integration.tests.other.SSRFXsdSchemaValidationTestCase"/>
+        </classes>
+    </test>
+
+    <test name="apim-ssrf-xsd-loopback-allow-tests" preserve-order="true" parallel="false" group-by-instances="true">
+        <parameter name="group" value="group2"/>
+        <groups>
+            <run>
+                <include name="ssrfXsdLoopbackAllow"/>
+            </run>
+        </groups>
+        <classes>
+            <class name="org.wso2.am.integration.tests.other.SSRFXsdSchemaValidationLoopbackAllowTestSuite"/>
+            <class name="org.wso2.am.integration.tests.other.SSRFXsdSchemaValidationTestCase"/>
+        </classes>
+    </test>
+
     <test name="apim-host-validation-allow-mode-tests" preserve-order="true" parallel="false" group-by-instances="true">
         <parameter name="group" value="group2"/>
         <classes>

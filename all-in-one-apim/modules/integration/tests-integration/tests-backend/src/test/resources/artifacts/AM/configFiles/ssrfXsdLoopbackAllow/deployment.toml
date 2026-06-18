@@ -354,5 +354,5 @@ http_method = "all"
 
 [apim.network_security.access_control]
 mode = "allow"
-hosts = ["127.0.0.1"]
+hosts = ["127.0.0.1", "203.0.113.10"]
 block_private_network_access = false
