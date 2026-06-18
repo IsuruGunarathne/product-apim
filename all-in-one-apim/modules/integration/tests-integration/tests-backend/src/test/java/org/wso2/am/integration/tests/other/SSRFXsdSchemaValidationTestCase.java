@@ -328,6 +328,31 @@ public class SSRFXsdSchemaValidationTestCase extends APIManagerLifecycleBaseTest
     }
 
     // =========================================================================================
+    // Case E — allow mode: an xsdURL that 302-redirects to a non-allow-listed host is refused
+    // =========================================================================================
+
+    @Test(groups = {"wso2.am", "ssrfXsdLoopbackAllow"},
+            description = "SSRF XSD [allow]: an xsdURL that 302-redirects to a non-allow-listed host is refused")
+    public void testCaseE_RedirectToNonAllowedHostBlocked() throws Exception {
+        updateApiXsdUrl(XSD_BASE + "/redirect-edge.xsd");
+        xsdServer.resetRequests();
+
+        HttpResponse response = invokeXmlPost();
+
+        Assert.assertEquals(response.getResponseCode(), HttpStatus.SC_BAD_REQUEST,
+                "Case E: a redirect from an allow-listed edge to a non-allow-listed host must be blocked. Body: "
+                        + response.getData());
+        // The allow-listed edge is fetched; the redirect target (10.255.255.1, not allow-listed) is refused.
+        xsdServer.verify(moreThanOrExactly(1), getRequestedFor(urlPathEqualTo("/redirect-edge.xsd")));
+        String body = response.getData();
+        Assert.assertTrue(body != null && (body.contains("not trusted") || body.contains("not permitted")),
+                "Case E: the 400 must indicate a policy block of the redirect target (not a generic fetch error), "
+                        + "confirming the redirect Location was re-validated. Body: " + body);
+        log.info("Case E passed: 302 from the allow-listed edge to a non-allow-listed host blocked (HTTP 400); "
+                + "the redirect target was re-validated, not followed.");
+    }
+
+    // =========================================================================================
     // Helpers — operation policy + API lifecycle
     // =========================================================================================
 
@@ -483,6 +508,9 @@ public class SSRFXsdSchemaValidationTestCase extends APIManagerLifecycleBaseTest
         xsdServer.stubFor(get(urlPathEqualTo("/main-noncrosshost.xsd"))
                 .willReturn(xml(MAIN_XSD_WITH_UNALLOWED_IMPORT)));
         xsdServer.stubFor(get(urlPathEqualTo("/main-with-dtd.xsd")).willReturn(xml(MAIN_XSD_WITH_DTD)));
+        // Edge whose 302 redirect points at a NON-allow-listed host (the redirect-bypass case).
+        xsdServer.stubFor(get(urlPathEqualTo("/redirect-edge.xsd")).willReturn(aResponse()
+                .withStatus(302).withHeader("Location", "http://10.255.255.1/secret.xsd")));
         dtdServer.stubFor(get(urlPathEqualTo("/evil.dtd")).willReturn(aResponse()
                 .withStatus(200).withHeader("Content-Type", "application/xml-dtd")
                 .withBody("<!ELEMENT root (#PCDATA)>")));
