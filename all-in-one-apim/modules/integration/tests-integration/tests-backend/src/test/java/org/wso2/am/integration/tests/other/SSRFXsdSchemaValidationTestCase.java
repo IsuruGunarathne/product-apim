@@ -190,7 +190,7 @@ public class SSRFXsdSchemaValidationTestCase extends APIManagerLifecycleBaseTest
 
     @BeforeClass(alwaysRun = true)
     public void setEnvironment() throws Exception {
-        super.init();
+        initWithRetry();
 
         startStubs();
 
@@ -222,6 +222,29 @@ public class SSRFXsdSchemaValidationTestCase extends APIManagerLifecycleBaseTest
 
         log.info("SSRFXsdSchemaValidationTestCase setUp complete: apiId=" + apiId
                 + " xsdPolicyId=" + xsdPolicyId);
+    }
+
+    /**
+     * Runs {@code super.init()} with a few retries. The static DCR client cache is already warmed by
+     * {@link SSRFXsdScopedRunWarmupTestCase}, but right after a config-restart the token/REST endpoints
+     * can briefly lag; {@code init()} only (re)creates client instances, so retrying it is safe.
+     */
+    private void initWithRetry() throws Exception {
+        final int maxAttempts = 10;
+        final long retryIntervalMs = 5000L;
+        Exception lastError = null;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                super.init();
+                return;
+            } catch (Exception e) {
+                lastError = e;
+                Thread.sleep(retryIntervalMs);
+            }
+        }
+        throw new IllegalStateException(
+                "super.init() did not succeed after " + maxAttempts + " attempts (REST endpoints not ready)",
+                lastError);
     }
 
     @AfterClass(alwaysRun = true)
