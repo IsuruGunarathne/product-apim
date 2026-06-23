@@ -1,0 +1,48 @@
+<!DOCTYPE suite SYSTEM "http://testng.org/testng-1.0.dtd" >
+
+<!--
+  Focused suite for running ONLY the SSRF user-store RDBMS connection integration tests against a
+  freshly provisioned server (the engine listeners + automation.xml + APIMCarbonServerExtension
+  start the server from carbon.zip). Run with:
+    mvn -pl <tests-backend> test -DskipIntegrationTests=false \
+        -Dsurefire.suiteXmlFiles=src/test/resources/testng-ssrf-userstore.xml
+-->
+<suite name="apim-ssrf-userstore-suite" parallel="false">
+    <parameter name="useDefaultListeners" value="false"/>
+
+    <listeners>
+        <listener class-name="org.wso2.carbon.automation.engine.testlisteners.TestExecutionListener"/>
+        <listener class-name="org.wso2.carbon.automation.engine.testlisteners.TestManagerListener"/>
+        <listener class-name="org.wso2.carbon.automation.engine.testlisteners.TestReportListener"/>
+        <listener class-name="org.wso2.carbon.automation.engine.testlisteners.TestSuiteListener"/>
+        <listener class-name="org.wso2.carbon.automation.engine.testlisteners.TestTransformerListener"/>
+        <listener class-name="org.wso2.am.integration.tests.listener.APIMAlterSuiteListener"/>
+        <listener class-name="org.wso2.am.integration.tests.listener.APIMTestExecutionListener"/>
+    </listeners>
+
+    <!-- Warm up: prime the DCR client cache and verify REST endpoints are up before config-restart suites. -->
+    <test name="apim-ssrf-userstore-warmup" preserve-order="true" parallel="false">
+        <groups>
+            <run>
+                <include name="ssrfXsdWarmup"/>
+            </run>
+        </groups>
+        <classes>
+            <class name="org.wso2.am.integration.tests.other.SSRFXsdScopedRunWarmupTestCase"/>
+        </classes>
+    </test>
+
+    <!-- Main suite: apply ssrfUserstoreAllow config, run the RDBMS connection SSRF gate tests. -->
+    <test name="apim-ssrf-userstore-allow-tests" preserve-order="true" parallel="false" group-by-instances="true">
+        <groups>
+            <run>
+                <include name="ssrfUserstoreAllow"/>
+            </run>
+        </groups>
+        <classes>
+            <class name="org.wso2.am.integration.tests.other.SSRFUserstoreRdbmsTestSuite"/>
+            <class name="org.wso2.am.integration.tests.other.SSRFUserstoreRdbmsConnectionTestCase"/>
+        </classes>
+    </test>
+
+</suite>
