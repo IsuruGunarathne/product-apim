@@ -1,0 +1,273 @@
+/*
+ * Copyright (c) 2026, WSO2 LLC. (http://www.wso2.com).
+ *
+ * WSO2 LLC. licenses this file to you under the Apache License,
+ * Version 2.0 (the "License"); you may not use this file except
+ * in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.wso2.am.integration.tests.other;
+
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.testng.Assert;
+import org.testng.annotations.AfterClass;
+import org.testng.annotations.BeforeClass;
+import org.testng.annotations.Test;
+import org.wso2.am.integration.test.utils.base.APIMIntegrationBaseTest;
+import org.wso2.am.integration.test.utils.base.APIMIntegrationConstants;
+import org.wso2.am.integration.test.utils.http.HTTPSClientUtils;
+import org.wso2.carbon.automation.test.utils.http.client.HttpResponse;
+import org.wso2.carbon.integration.common.admin.client.AuthenticatorClient;
+
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Integration tests for SSRF protection of the event-publisher "test publisher connection" admin
+ * service.
+ *
+ * <p>The WSO2 Carbon {@code EventPublisherAdminService#testPublisherConnection} SOAP operation
+ * accepts a caller-supplied output-adapter configuration. For a JMS adapter this includes the
+ * {@code java.naming.provider.url} property (a broker URL). Before the JMS event adapter attempts
+ * {@code testConnect()} (which would open a JNDI/JMS connection to that provider URL), the server
+ * calls {@code APIUtil.validateRemoteURL} (the G2 gate). This is the SSRF gate-entry point for
+ * event-publisher provisioning flows.
+ *
+ * <p>This test suite verifies two key behaviours under the {@code ssrfEventPublisherAllow} config
+ * ({@code mode=allow, hosts=["localhost","127.0.0.1"], block_private_network_access=false}):
+ * <ol>
+ *   <li><b>Blocked:</b> A JMS provider URL pointing at a link-local / cloud-metadata address
+ *       ({@code 169.254.169.254}) is rejected with a policy-block fault before any connection
+ *       attempt — proving that the SSRF gate fires on every caller-supplied provider URL.</li>
+ *   <li><b>Gate passes (allow-listed host):</b> A JMS provider URL pointing at {@code localhost}
+ *       is <em>not</em> blocked by the SSRF gate; the request proceeds to the JMS/JNDI layer
+ *       (where it fails with a connection error because no broker is running — that error is
+ *       unrelated to SSRF and is expected and acceptable).</li>
+ * </ol>
+ *
+ * <p>The tests run under the {@code ssrfEventPublisherAllow} deployment config, applied and
+ * restored by {@link SSRFEventPublisherTestSuite}.
+ *
+ * <p>Transport: raw SOAP 1.1 over HTTPS to
+ * {@code https://localhost:9443/services/EventPublisherAdminService}, using Basic auth
+ * (admin/admin). This avoids session-cookie lifecycle complexity while still exercising the
+ * full server-side SSRF gate path.
+ */
+public class SSRFEventPublisherConnectionTestCase extends APIMIntegrationBaseTest {
+
+    private static final Log log = LogFactory.getLog(SSRFEventPublisherConnectionTestCase.class);
+
+    /** Base64(admin:admin) — the only credential available in the integration-test environment. */
+    private static final String BASIC_AUTH_HEADER = "Basic YWRtaW46YWRtaW4=";
+
+    /**
+     * SOAPAction for {@code EventPublisherAdminService#testPublisherConnection}.
+     * Must match the WSDL operation action exactly (urn: prefix + method name).
+     */
+    private static final String SOAP_ACTION = "urn:testPublisherConnection";
+
+    /**
+     * Schema namespace for the testPublisherConnection request element and its (qualified)
+     * parameters. Per the EventPublisherAdminService WSDL the operation schema has
+     * targetNamespace="http://admin.publisher.event.carbon.wso2.org" with
+     * elementFormDefault="qualified", so the wrapper AND every parameter element live in this
+     * namespace.
+     */
+    private static final String SER_NS = "http://admin.publisher.event.carbon.wso2.org";
+
+    /**
+     * Schema namespace for the output-property-configuration DTO child elements
+     * ({@code key}, {@code static}, {@code value}). Per the WSDL these complex-type members live
+     * in the "/xsd" namespace.
+     */
+    private static final String XSD_NS = "http://admin.publisher.event.carbon.wso2.org/xsd";
+
+    /**
+     * The full back-end URL of the management services endpoint, e.g.
+     * {@code https://localhost:9443/services/}.
+     */
+    private String backendUrl;
+
+    // =========================================================================================
+    // Set-up / tear-down
+    // =========================================================================================
+
+    /**
+     * Initialises the test: calls {@code super.init()} to populate the inherited context fields
+     * (including {@code gatewayContextMgt}), then derives the back-end services URL and obtains
+     * a session cookie via {@link AuthenticatorClient} for diagnostic purposes. The actual SOAP
+     * calls use Basic auth to avoid session-token lifecycle issues.
+     */
+    @BeforeClass(alwaysRun = true)
+    public void setEnvironment() throws Exception {
+        super.init();
+
+        // gatewayContextMgt is set by APIMIntegrationBaseTest.init() and points at the Key Manager
+        // management endpoint (https://localhost:9443/services/).
+        backendUrl = gatewayContextMgt.getContextUrls().getBackEndUrl();
+        if (!backendUrl.endsWith("/")) {
+            backendUrl = backendUrl + "/";
+        }
+
+        // Obtain a session cookie via AuthenticatorClient — used for logging/diagnostics.
+        // The SOAP calls themselves use Basic auth (more reliable across restart cycles).
+        AuthenticatorClient authenticatorClient = new AuthenticatorClient(backendUrl);
+        String sessionCookie = authenticatorClient.login(
+                APIMIntegrationConstants.ADMIN_USERNAME,
+                APIMIntegrationConstants.ADMIN_PASSWORD,
+                APIMIntegrationConstants.LOCAL_HOST_NAME);
+        log.info("SSRFEventPublisherConnectionTestCase setUp complete: backendUrl=" + backendUrl
+                + " sessionCookie=" + (sessionCookie != null ? "obtained" : "null"));
+    }
+
+    @AfterClass(alwaysRun = true)
+    public void cleanUp() throws Exception {
+        super.cleanUp();
+    }
+
+    // =========================================================================================
+    // Test: blocked host (link-local / cloud metadata)
+    // =========================================================================================
+
+    /**
+     * Verifies that a JMS provider URL targeting the IMDS link-local address
+     * {@code 169.254.169.254} is blocked by the SSRF gate before any outbound connection is made.
+     *
+     * <p>Expected: the SOAP response contains a fault message indicating the URL was blocked by
+     * the network security access control policy (e.g. "blocked by network security access
+     * control policy" or "not trusted"). This fault originates from
+     * {@code APIUtil.validateRemoteURL} inside the JMS event-adapter {@code testConnect()} path.
+     */
+    @Test(groups = {"wso2.am", "ssrfEventPublisherAllow"},
+            description = "SSRF EventPublisher [allow, 169.254.169.254 not listed]: JMS provider URL "
+                    + "to link-local IMDS address is blocked by the SSRF gate before connection attempt")
+    public void testBlockedJmsHost() throws Exception {
+        String providerUrl = "tcp://169.254.169.254:61616";
+        String responseBody = callTestPublisherConnection("jms", providerUrl);
+
+        log.info("testBlockedJmsHost response: " + responseBody);
+
+        // The SSRF gate must have fired: the fault must contain the block message from APIUtil.
+        // Accept either the primary phrasing or the older "not trusted" phrasing.
+        boolean blocked = responseBody != null
+                && (responseBody.toLowerCase().contains("blocked by network security access control policy")
+                || responseBody.toLowerCase().contains("not trusted"));
+        Assert.assertTrue(blocked,
+                "Expected the SSRF gate to block 169.254.169.254 with a policy-block fault, "
+                        + "but the response did not contain the expected block message. "
+                        + "Response body: " + responseBody);
+        log.info("testBlockedJmsHost passed: 169.254.169.254 blocked by SSRF gate as expected.");
+    }
+
+    // =========================================================================================
+    // Test: allow-listed host passes the gate
+    // =========================================================================================
+
+    /**
+     * Verifies that a JMS provider URL targeting {@code localhost} (which is allow-listed in the
+     * {@code ssrfEventPublisherAllow} config) is <em>not</em> blocked by the SSRF gate.
+     *
+     * <p>No JMS broker is running on {@code localhost:61616}, so the JMS/JNDI layer will fail to
+     * connect and the response will contain a connection error — but it must NOT contain the SSRF
+     * policy-block fault. This confirms the gate passes allow-listed hosts through to the next
+     * processing stage.
+     */
+    @Test(groups = {"wso2.am", "ssrfEventPublisherAllow"},
+            description = "SSRF EventPublisher [allow, localhost listed]: JMS provider URL to "
+                    + "allow-listed host passes the SSRF gate (JMS/JNDI connection error is expected; "
+                    + "SSRF block is not)")
+    public void testAllowedLocalhost() throws Exception {
+        String providerUrl = "tcp://localhost:61616";
+        String responseBody = callTestPublisherConnection("jms", providerUrl);
+
+        log.info("testAllowedLocalhost response: " + responseBody);
+
+        // The SSRF gate must NOT have fired for an allow-listed host.
+        boolean ssrfBlocked = responseBody != null
+                && (responseBody.toLowerCase().contains("blocked by network security access control policy")
+                || responseBody.toLowerCase().contains("not trusted"));
+        Assert.assertFalse(ssrfBlocked,
+                "The SSRF gate must NOT block localhost (it is allow-listed), but the response "
+                        + "contained an SSRF policy-block fault. Response body: " + responseBody);
+        log.info("testAllowedLocalhost passed: localhost not SSRF-blocked; gate correctly "
+                + "passed it through to the JMS/JNDI layer.");
+    }
+
+    // =========================================================================================
+    // Helper — SOAP invocation
+    // =========================================================================================
+
+    /**
+     * Posts a SOAP 1.1 {@code testPublisherConnection} request to
+     * {@code EventPublisherAdminService} and returns the raw response body as a String.
+     *
+     * <p>The request configures an output adapter whose {@code java.naming.provider.url} property
+     * carries the caller-supplied broker URL; only the {@code adapterType} and
+     * {@code providerUrlValue} vary per call. Basic auth is used (admin/admin, Base64-encoded) so
+     * that the call works across server restart cycles without needing a live session cookie.
+     *
+     * @param adapterType      the output event-adapter type, e.g. {@code jms}
+     * @param providerUrlValue the JMS provider URL to test, e.g.
+     *                         {@code tcp://169.254.169.254:61616}
+     * @return the HTTP response body (the raw SOAP envelope or fault XML), or {@code null} if
+     *         the HTTP call itself failed at the transport level
+     * @throws Exception if the HTTPS client encounters an unrecoverable error
+     */
+    private String callTestPublisherConnection(String adapterType, String providerUrlValue)
+            throws Exception {
+        String serviceUrl = backendUrl + "EventPublisherAdminService";
+
+        // Construct the SOAP 1.1 envelope. The wrapper + the four direct params live in SER_NS
+        // (elementFormDefault qualified); the outputPropertyConfiguration DTO child elements
+        // (key, static, value — in that order) live in XSD_NS.
+        String soapBody = "<soapenv:Envelope "
+                + "xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\" "
+                + "xmlns:ser=\"" + SER_NS + "\" "
+                + "xmlns:xsd=\"" + XSD_NS + "\">"
+                + "<soapenv:Header/>"
+                + "<soapenv:Body>"
+                + "<ser:testPublisherConnection>"
+                + "<ser:eventPublisherName>ssrfEventPubTest</ser:eventPublisherName>"
+                + "<ser:eventAdapterType>" + adapterType + "</ser:eventAdapterType>"
+                + "<ser:outputPropertyConfiguration>"
+                + "<xsd:key>java.naming.provider.url</xsd:key>"
+                + "<xsd:static>true</xsd:static>"
+                + "<xsd:value>" + providerUrlValue + "</xsd:value>"
+                + "</ser:outputPropertyConfiguration>"
+                + "<ser:outputPropertyConfiguration>"
+                + "<xsd:key>java.naming.factory.initial</xsd:key>"
+                + "<xsd:static>true</xsd:static>"
+                + "<xsd:value>org.wso2.andes.jndi.PropertiesFileInitialContextFactory</xsd:value>"
+                + "</ser:outputPropertyConfiguration>"
+                + "<ser:messageFormat>map</ser:messageFormat>"
+                + "</ser:testPublisherConnection>"
+                + "</soapenv:Body>"
+                + "</soapenv:Envelope>";
+
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Content-Type", "text/xml; charset=UTF-8");
+        headers.put("SOAPAction", "\"" + SOAP_ACTION + "\"");
+        headers.put("Authorization", BASIC_AUTH_HEADER);
+
+        HttpResponse httpResponse = HTTPSClientUtils.doPost(serviceUrl, headers, soapBody);
+        if (httpResponse == null) {
+            log.warn("callTestPublisherConnection: HTTPSClientUtils.doPost returned null for URL: "
+                    + serviceUrl);
+            return null;
+        }
+        log.debug("callTestPublisherConnection: HTTP status=" + httpResponse.getResponseCode()
+                + " body=" + httpResponse.getData());
+        return httpResponse.getData();
+    }
+}
