@@ -268,9 +268,11 @@ public class SSRFEventPublisherConnectionTestCase extends APIMIntegrationBaseTes
      * file it calls {@code CarbonEventPublisherService.addEventPublisherConfiguration}, which
      * invokes the SSRF gate (via {@code APIUtil.validateRemoteURL}) on the adapter URLs.
      *
-     * <p>Crucially, the gate fires <em>before</em> the publisher subscribes to its {@code from}
-     * stream {@code org.wso2.ssrf.test.stream} (which is intentionally absent). So the block is
-     * the reason the publisher fails to deploy — the missing stream does not mask it.
+     * <p>The artifact's {@code from} stream {@code org.wso2.apimgt.notification.stream} is one the
+     * pack ships, so the deployer proceeds into {@code addEventPublisherConfiguration} where the
+     * SSRF gate (G1) fires on the static {@code receiverURL}. (A <em>non-existent</em> stream makes
+     * the deployer hold the publisher back in an inactive "Stream … does not exist" state
+     * <em>before</em> the gate — verified live — so the stream must exist for this to exercise G1.)
      *
      * <p><b>Proof approach (log-based):</b> the test captures the server log's byte length as a
      * baseline immediately before the drop, then after a short hot-deploy wait scans only the
@@ -289,7 +291,7 @@ public class SSRFEventPublisherConnectionTestCase extends APIMIntegrationBaseTes
             description = "SSRF EventPublisher G1 deploy gate [allow, 169.254.169.254 not listed]: "
                     + "hot-deploying a wso2event publisher whose adapter targets a blocked static URL "
                     + "is rejected at CarbonEventPublisherService.addEventPublisherConfiguration "
-                    + "(before the absent from-stream is subscribed), and the block is logged")
+                    + "(deploy rejected with the policy-block fault, logged naming the publisher)")
     public void testFileDropDeployBlocked() throws Exception {
         String eventPublishersDir = FrameworkPathUtil.getCarbonHome() + File.separator + "repository"
                 + File.separator + "deployment" + File.separator + "server" + File.separator

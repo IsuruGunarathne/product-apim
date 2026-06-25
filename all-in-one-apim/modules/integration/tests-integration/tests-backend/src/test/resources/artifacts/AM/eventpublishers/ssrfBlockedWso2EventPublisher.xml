@@ -1,5 +1,5 @@
 <eventPublisher name="ssrfBlockedWso2EventPublisher" statistics="disable" trace="disable" xmlns="http://wso2.org/carbon/eventpublisher">
-  <from streamName="org.wso2.ssrf.test.stream" version="1.0.0"/>
+  <from streamName="org.wso2.apimgt.notification.stream" version="1.0.0"/>
   <mapping customMapping="disable" type="wso2event"/>
   <to eventAdapterType="wso2event">
     <property name="receiverURL">tcp://169.254.169.254:7611</property>
