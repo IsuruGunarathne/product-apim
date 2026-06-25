@@ -35,9 +35,7 @@ import org.wso2.carbon.automation.test.utils.http.client.HttpResponse;
 import org.wso2.carbon.integration.common.admin.client.AuthenticatorClient;
 import org.wso2.carbon.integration.common.utils.mgt.ServerConfigurationManager;
 
-import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileReader;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -274,13 +272,18 @@ public class SSRFEventPublisherConnectionTestCase extends APIMIntegrationBaseTes
      * stream {@code org.wso2.ssrf.test.stream} (which is intentionally absent). So the block is
      * the reason the publisher fails to deploy — the missing stream does not mask it.
      *
-     * <p><b>Proof approach (log-based):</b> after the drop and a short hot-deploy wait, the test
-     * reads the server log ({@code <carbonHome>/repository/logs/wso2carbon.log}) and asserts it
-     * contains the publisher name together with a block indicator (the policy-block message, an
-     * {@code EventPublisherConfigurationException}, or the blocked host {@code 169.254.169.254}).
-     * The server-side log is directly readable in this single-node standalone test framework
-     * because the test JVM shares the file system with the server, so the log assertion is the
-     * primary, most precise proof that the block happened at the G1 deploy gate.
+     * <p><b>Proof approach (log-based):</b> the test captures the server log's byte length as a
+     * baseline immediately before the drop, then after a short hot-deploy wait scans only the
+     * content appended since that baseline of
+     * {@code <carbonHome>/repository/logs/wso2carbon.log}. It asserts that this post-drop region
+     * contains the unique publisher name {@value #BLOCKED_PUBLISHER_NAME} together with a block
+     * indicator (the policy-block message, an {@code EventPublisherConfigurationException}, or the
+     * "not trusted" phrasing). Requiring the publisher name — which no sibling test logs — plus the
+     * offset prevents a false positive from {@code testBlockedJmsHost}, which runs earlier in the
+     * same JVM and also logs {@code 169.254.169.254} with the block phrase. The server-side log is
+     * directly readable in this single-node standalone test framework because the test JVM shares
+     * the file system with the server, so the log assertion is the primary, most precise proof that
+     * the block happened at the G1 deploy gate.
      */
     @Test(groups = {"wso2.am", "ssrfEventPublisherAllow"},
             description = "SSRF EventPublisher G1 deploy gate [allow, 169.254.169.254 not listed]: "
@@ -298,6 +301,15 @@ public class SSRFEventPublisherConnectionTestCase extends APIMIntegrationBaseTes
         Assert.assertTrue(sourceArtifact.exists(),
                 "Test artifact not found on the classpath: " + sourceArtifact.getAbsolutePath());
 
+        // Baseline the server log BEFORE the drop so the assertion only scans content produced by
+        // this drop. Sibling tests in this class (e.g. testBlockedJmsHost, which runs first under
+        // TestNG's alphabetical ordering) also log 169.254.169.254 with the block phrase earlier in
+        // the same wso2carbon.log; scanning from this offset excludes those earlier lines and
+        // prevents a false positive.
+        String logFilePath = FrameworkPathUtil.getCarbonHome() + File.separator + "repository"
+                + File.separator + "logs" + File.separator + "wso2carbon.log";
+        long logBaseline = new File(logFilePath).length();
+
         // 1. Drop the malicious publisher into the running server's hot-deployment dir. This is the
         //    same copy idiom used by the WebSocket/WebSub event-publisher tests
         //    (ServerConfigurationManager.applyConfigurationWithoutRestart with restartServer=false).
@@ -307,13 +319,12 @@ public class SSRFEventPublisherConnectionTestCase extends APIMIntegrationBaseTes
                 + eventPublishersDir);
 
         // 2. Wait for the hot deployer to pick up the file and (attempt to) deploy it. We poll the
-        //    server log for the block evidence rather than sleeping a fixed long interval.
-        String logFilePath = FrameworkPathUtil.getCarbonHome() + File.separator + "repository"
-                + File.separator + "logs" + File.separator + "wso2carbon.log";
+        //    server log (only the content appended since the baseline) for the block evidence
+        //    rather than sleeping a fixed long interval.
         boolean blockDetected = false;
         long deadline = System.currentTimeMillis() + DEPLOY_POLL_TIMEOUT_MS;
         while (System.currentTimeMillis() < deadline) {
-            if (logContainsDeployBlock(logFilePath)) {
+            if (logContainsDeployBlock(logFilePath, logBaseline)) {
                 blockDetected = true;
                 break;
             }
@@ -346,35 +357,62 @@ public class SSRFEventPublisherConnectionTestCase extends APIMIntegrationBaseTes
     }
 
     /**
-     * Scans the server log for evidence that the dropped publisher was rejected by the SSRF deploy
-     * gate. A line counts as block evidence when it mentions the publisher (by name) <em>or</em> a
-     * deploy failure for it, together with any of the recognised block indicators: the policy-block
-     * message, an {@code EventPublisherConfigurationException}, or the blocked host
-     * {@code 169.254.169.254}.
+     * Scans the server log — reading only the content appended <em>after</em> {@code baseline}
+     * (the byte offset captured immediately before the artifact was dropped) — for evidence that
+     * the dropped publisher was rejected by the SSRF deploy gate.
+     *
+     * <p>A match requires BOTH of the following to appear somewhere in the post-baseline region:
+     * <ul>
+     *   <li>the publisher name token {@value #BLOCKED_PUBLISHER_NAME} — uniquely identifies THIS
+     *       dropped artifact; no sibling test (e.g. {@code testBlockedJmsHost}) ever logs it; and</li>
+     *   <li>a block indicator: the policy-block message
+     *       ("blocked by network security access control policy"), an
+     *       {@code EventPublisherConfigurationException}, or the "not trusted" phrasing.</li>
+     * </ul>
+     * The two tokens need not be on the same line — the Carbon deployer typically logs the failure
+     * across a multi-line stack trace where the publisher/file name and the underlying block reason
+     * land on different lines. Requiring both tokens (rather than the bare host address, which is
+     * shared with {@code testBlockedJmsHost}) plus the offset makes this assertion robust against
+     * earlier sibling-test log lines.
      *
      * @param logFilePath absolute path of {@code wso2carbon.log}
-     * @return {@code true} if a block-evidence line is found; {@code false} otherwise (including
-     *         when the log file does not yet exist)
+     * @param baseline    byte offset to start scanning from (the log length captured just before
+     *                    the drop). If the file has since rolled and is now shorter than the
+     *                    baseline, the scan restarts from the beginning.
+     * @return {@code true} if both required tokens are found in the post-baseline region;
+     *         {@code false} otherwise (including when the log file does not yet exist)
      */
-    private boolean logContainsDeployBlock(String logFilePath) {
+    private boolean logContainsDeployBlock(String logFilePath, long baseline) {
         File logFile = new File(logFilePath);
         if (!logFile.exists()) {
             return false;
         }
-        try (BufferedReader reader = new BufferedReader(new FileReader(logFile))) {
+        long start = (logFile.length() < baseline) ? 0L : baseline;
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(logFile, "r")) {
+            raf.seek(start);
+            boolean mentionsPublisher = false;
+            boolean hasBlockIndicator = false;
+            String matchedPublisherLine = null;
+            String matchedIndicatorLine = null;
             String line;
-            while ((line = reader.readLine()) != null) {
+            // RandomAccessFile.readLine() reads bytes as ISO-8859-1, which is fine for ASCII log
+            // tokens like the publisher name, the block phrases, and the host address.
+            while ((line = raf.readLine()) != null) {
                 String lower = line.toLowerCase();
-                boolean mentionsPublisher = lower.contains(BLOCKED_PUBLISHER_NAME.toLowerCase());
-                boolean hasBlockIndicator =
-                        lower.contains("blocked by network security access control policy")
-                                || lower.contains("eventpublisherconfigurationexception")
-                                || lower.contains("169.254.169.254")
-                                || lower.contains("not trusted");
-                // Require both the publisher reference (or the blocked host, which is unique to this
-                // artifact) and a block indicator, to avoid false positives from unrelated log noise.
-                if (hasBlockIndicator && (mentionsPublisher || lower.contains("169.254.169.254"))) {
-                    log.info("logContainsDeployBlock: matched block-evidence line: " + line);
+                if (lower.contains(BLOCKED_PUBLISHER_NAME.toLowerCase())) {
+                    mentionsPublisher = true;
+                    matchedPublisherLine = line;
+                }
+                if (lower.contains("blocked by network security access control policy")
+                        || lower.contains("eventpublisherconfigurationexception")
+                        || lower.contains("not trusted")) {
+                    hasBlockIndicator = true;
+                    matchedIndicatorLine = line;
+                }
+                if (mentionsPublisher && hasBlockIndicator) {
+                    log.info("logContainsDeployBlock: matched block evidence in post-drop content "
+                            + "(publisher line: " + matchedPublisherLine + " | indicator line: "
+                            + matchedIndicatorLine + ")");
                     return true;
                 }
             }
