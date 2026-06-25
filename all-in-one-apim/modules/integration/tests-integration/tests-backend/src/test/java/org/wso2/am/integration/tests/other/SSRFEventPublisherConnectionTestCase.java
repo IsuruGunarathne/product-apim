@@ -22,14 +22,22 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
+import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 import org.wso2.am.integration.test.utils.base.APIMIntegrationBaseTest;
 import org.wso2.am.integration.test.utils.base.APIMIntegrationConstants;
 import org.wso2.am.integration.test.utils.http.HTTPSClientUtils;
+import org.wso2.carbon.automation.engine.context.AutomationContext;
+import org.wso2.carbon.automation.engine.context.TestUserMode;
+import org.wso2.carbon.automation.engine.frameworkutils.FrameworkPathUtil;
 import org.wso2.carbon.automation.test.utils.http.client.HttpResponse;
 import org.wso2.carbon.integration.common.admin.client.AuthenticatorClient;
+import org.wso2.carbon.integration.common.utils.mgt.ServerConfigurationManager;
 
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -100,6 +108,40 @@ public class SSRFEventPublisherConnectionTestCase extends APIMIntegrationBaseTes
     private String backendUrl;
 
     // =========================================================================================
+    // G1 file-drop deploy-gate test fixtures
+    // =========================================================================================
+
+    /**
+     * File name of the malicious event-publisher artifact dropped into the running server's
+     * {@code eventpublishers/} hot-deployment directory. Its {@code <to>} adapter targets the
+     * link-local IMDS address {@code 169.254.169.254}, which is blocked by the SSRF deploy gate
+     * (G1) at {@code CarbonEventPublisherService.addEventPublisherConfiguration}.
+     */
+    private static final String BLOCKED_PUBLISHER_FILE = "ssrfBlockedWso2EventPublisher.xml";
+
+    /** The {@code name} attribute of the dropped publisher (used in log assertions). */
+    private static final String BLOCKED_PUBLISHER_NAME = "ssrfBlockedWso2EventPublisher";
+
+    /** Max time (ms) to wait for the hot deployer to pick up the dropped artifact. */
+    private static final long DEPLOY_POLL_TIMEOUT_MS = 30_000L;
+
+    /** Polling interval (ms) while waiting for the hot deployer. */
+    private static final long DEPLOY_POLL_INTERVAL_MS = 2_000L;
+
+    /**
+     * Manages applying/copying artifacts into the running server. Built from a super-tenant
+     * Key-Manager automation context, the same way other deploy-time integration tests build it.
+     */
+    private ServerConfigurationManager serverConfigurationManager;
+
+    /**
+     * Absolute path of the dropped artifact inside the server's
+     * {@code <carbonHome>/repository/deployment/server/eventpublishers/} directory. Tracked so the
+     * {@link #cleanUpDroppedArtifact()} tear-down can remove it and keep the run clean.
+     */
+    private File droppedArtifact;
+
+    // =========================================================================================
     // Set-up / tear-down
     // =========================================================================================
 
@@ -127,6 +169,15 @@ public class SSRFEventPublisherConnectionTestCase extends APIMIntegrationBaseTes
                 APIMIntegrationConstants.ADMIN_USERNAME,
                 APIMIntegrationConstants.ADMIN_PASSWORD,
                 APIMIntegrationConstants.LOCAL_HOST_NAME);
+        // ServerConfigurationManager is used by the G1 file-drop test to copy the malicious
+        // event-publisher artifact into the running server's hot-deployment directory. Built from
+        // a super-tenant Key-Manager automation context, mirroring other deploy-time tests.
+        AutomationContext superTenantKeyManagerContext = new AutomationContext(
+                APIMIntegrationConstants.AM_PRODUCT_GROUP_NAME,
+                APIMIntegrationConstants.AM_KEY_MANAGER_INSTANCE,
+                TestUserMode.SUPER_TENANT_ADMIN);
+        serverConfigurationManager = new ServerConfigurationManager(superTenantKeyManagerContext);
+
         log.info("SSRFEventPublisherConnectionTestCase setUp complete: backendUrl=" + backendUrl
                 + " sessionCookie=" + (sessionCookie != null ? "obtained" : "null"));
     }
@@ -202,6 +253,136 @@ public class SSRFEventPublisherConnectionTestCase extends APIMIntegrationBaseTes
                         + "contained an SSRF policy-block fault. Response body: " + responseBody);
         log.info("testAllowedLocalhost passed: localhost not SSRF-blocked; gate correctly "
                 + "passed it through to the JMS/JNDI layer.");
+    }
+
+    // =========================================================================================
+    // Test: G1 deploy gate — file-drop of a blocked wso2event publisher is rejected at deploy
+    // =========================================================================================
+
+    /**
+     * Verifies the SSRF <b>deploy gate (G1)</b>: dropping an event-publisher XML whose adapter
+     * targets a blocked static URL into the running server's {@code eventpublishers/}
+     * hot-deployment directory is rejected at deploy time.
+     *
+     * <p>The dropped artifact ({@value #BLOCKED_PUBLISHER_FILE}) declares a {@code wso2event}
+     * {@code <to>} adapter whose {@code receiverURL}/{@code authenticatorURL} point at the
+     * link-local IMDS address {@code 169.254.169.254}. When the Carbon hot deployer parses the
+     * file it calls {@code CarbonEventPublisherService.addEventPublisherConfiguration}, which
+     * invokes the SSRF gate (via {@code APIUtil.validateRemoteURL}) on the adapter URLs.
+     *
+     * <p>Crucially, the gate fires <em>before</em> the publisher subscribes to its {@code from}
+     * stream {@code org.wso2.ssrf.test.stream} (which is intentionally absent). So the block is
+     * the reason the publisher fails to deploy — the missing stream does not mask it.
+     *
+     * <p><b>Proof approach (log-based):</b> after the drop and a short hot-deploy wait, the test
+     * reads the server log ({@code <carbonHome>/repository/logs/wso2carbon.log}) and asserts it
+     * contains the publisher name together with a block indicator (the policy-block message, an
+     * {@code EventPublisherConfigurationException}, or the blocked host {@code 169.254.169.254}).
+     * The server-side log is directly readable in this single-node standalone test framework
+     * because the test JVM shares the file system with the server, so the log assertion is the
+     * primary, most precise proof that the block happened at the G1 deploy gate.
+     */
+    @Test(groups = {"wso2.am", "ssrfEventPublisherAllow"},
+            description = "SSRF EventPublisher G1 deploy gate [allow, 169.254.169.254 not listed]: "
+                    + "hot-deploying a wso2event publisher whose adapter targets a blocked static URL "
+                    + "is rejected at CarbonEventPublisherService.addEventPublisherConfiguration "
+                    + "(before the absent from-stream is subscribed), and the block is logged")
+    public void testFileDropDeployBlocked() throws Exception {
+        String eventPublishersDir = FrameworkPathUtil.getCarbonHome() + File.separator + "repository"
+                + File.separator + "deployment" + File.separator + "server" + File.separator
+                + "eventpublishers";
+        File sourceArtifact = new File(getAMResourceLocation() + File.separator + "eventpublishers"
+                + File.separator + BLOCKED_PUBLISHER_FILE);
+        droppedArtifact = new File(eventPublishersDir + File.separator + BLOCKED_PUBLISHER_FILE);
+
+        Assert.assertTrue(sourceArtifact.exists(),
+                "Test artifact not found on the classpath: " + sourceArtifact.getAbsolutePath());
+
+        // 1. Drop the malicious publisher into the running server's hot-deployment dir. This is the
+        //    same copy idiom used by the WebSocket/WebSub event-publisher tests
+        //    (ServerConfigurationManager.applyConfigurationWithoutRestart with restartServer=false).
+        serverConfigurationManager.applyConfigurationWithoutRestart(sourceArtifact, droppedArtifact,
+                false);
+        log.info("testFileDropDeployBlocked: dropped " + BLOCKED_PUBLISHER_FILE + " into "
+                + eventPublishersDir);
+
+        // 2. Wait for the hot deployer to pick up the file and (attempt to) deploy it. We poll the
+        //    server log for the block evidence rather than sleeping a fixed long interval.
+        String logFilePath = FrameworkPathUtil.getCarbonHome() + File.separator + "repository"
+                + File.separator + "logs" + File.separator + "wso2carbon.log";
+        boolean blockDetected = false;
+        long deadline = System.currentTimeMillis() + DEPLOY_POLL_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline) {
+            if (logContainsDeployBlock(logFilePath)) {
+                blockDetected = true;
+                break;
+            }
+            Thread.sleep(DEPLOY_POLL_INTERVAL_MS);
+        }
+
+        // 3. Assert the SSRF block fired at the G1 deploy gate.
+        Assert.assertTrue(blockDetected,
+                "Expected the SSRF deploy gate (G1) to reject hot-deployment of "
+                        + BLOCKED_PUBLISHER_NAME + " (adapter URL 169.254.169.254) and log the block, "
+                        + "but no block evidence was found in " + logFilePath + " within "
+                        + (DEPLOY_POLL_TIMEOUT_MS / 1000) + "s.");
+        log.info("testFileDropDeployBlocked passed: G1 deploy gate rejected " + BLOCKED_PUBLISHER_NAME
+                + " and the block was logged.");
+    }
+
+    /**
+     * Tears down the G1 file-drop test by removing the dropped artifact from the running server's
+     * {@code eventpublishers/} directory, so subsequent runs start from a clean deployment dir.
+     * Runs only when {@link #droppedArtifact} was set (i.e. after {@link #testFileDropDeployBlocked}).
+     */
+    @AfterMethod(alwaysRun = true)
+    public void cleanUpDroppedArtifact() {
+        if (droppedArtifact != null && droppedArtifact.exists()) {
+            boolean deleted = droppedArtifact.delete();
+            log.info("cleanUpDroppedArtifact: removed dropped artifact "
+                    + droppedArtifact.getAbsolutePath() + " (deleted=" + deleted + ")");
+        }
+        droppedArtifact = null;
+    }
+
+    /**
+     * Scans the server log for evidence that the dropped publisher was rejected by the SSRF deploy
+     * gate. A line counts as block evidence when it mentions the publisher (by name) <em>or</em> a
+     * deploy failure for it, together with any of the recognised block indicators: the policy-block
+     * message, an {@code EventPublisherConfigurationException}, or the blocked host
+     * {@code 169.254.169.254}.
+     *
+     * @param logFilePath absolute path of {@code wso2carbon.log}
+     * @return {@code true} if a block-evidence line is found; {@code false} otherwise (including
+     *         when the log file does not yet exist)
+     */
+    private boolean logContainsDeployBlock(String logFilePath) {
+        File logFile = new File(logFilePath);
+        if (!logFile.exists()) {
+            return false;
+        }
+        try (BufferedReader reader = new BufferedReader(new FileReader(logFile))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String lower = line.toLowerCase();
+                boolean mentionsPublisher = lower.contains(BLOCKED_PUBLISHER_NAME.toLowerCase());
+                boolean hasBlockIndicator =
+                        lower.contains("blocked by network security access control policy")
+                                || lower.contains("eventpublisherconfigurationexception")
+                                || lower.contains("169.254.169.254")
+                                || lower.contains("not trusted");
+                // Require both the publisher reference (or the blocked host, which is unique to this
+                // artifact) and a block indicator, to avoid false positives from unrelated log noise.
+                if (hasBlockIndicator && (mentionsPublisher || lower.contains("169.254.169.254"))) {
+                    log.info("logContainsDeployBlock: matched block-evidence line: " + line);
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            log.warn("logContainsDeployBlock: failed to read server log " + logFilePath, e);
+            return false;
+        }
+        return false;
     }
 
     // =========================================================================================

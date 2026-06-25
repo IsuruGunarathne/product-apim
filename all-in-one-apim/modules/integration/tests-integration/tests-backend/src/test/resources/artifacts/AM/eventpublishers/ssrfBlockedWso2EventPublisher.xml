@@ -1,0 +1,11 @@
+<eventPublisher name="ssrfBlockedWso2EventPublisher" statistics="disable" trace="disable" xmlns="http://wso2.org/carbon/eventpublisher">
+  <from streamName="org.wso2.ssrf.test.stream" version="1.0.0"/>
+  <mapping customMapping="disable" type="wso2event"/>
+  <to eventAdapterType="wso2event">
+    <property name="receiverURL">tcp://169.254.169.254:7611</property>
+    <property name="authenticatorURL">ssl://169.254.169.254:7711</property>
+    <property name="protocol">thrift</property>
+    <property name="username">admin</property>
+    <property name="password">admin</property>
+  </to>
+</eventPublisher>
