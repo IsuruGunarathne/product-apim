@@ -75,6 +75,21 @@ public class SSRFUserstoreRdbmsConnectionTestCase extends APIMIntegrationBaseTes
     private static final String SOAP_ACTION = "urn:testRDBMSConnection";
 
     /**
+     * SOAPAction for {@code UserStoreConfigAdminService#addUserStore}.
+     * Must match the WSDL operation action exactly (urn: prefix + method name).
+     */
+    private static final String ADD_SOAP_ACTION = "urn:addUserStore";
+
+    /**
+     * Schema namespace for the {@code UserStoreDTO} / {@code PropertyDTO} complexTypes.
+     * Per the UserStoreConfigAdminService WSDL these types live in a schema with
+     * targetNamespace="http://dto.configuration.store.user.identity.carbon.wso2.org/xsd" and
+     * elementFormDefault="qualified", so EVERY child element of UserStoreDTO/PropertyDTO
+     * (className, domainId, properties, name, value, ...) is qualified in this namespace.
+     */
+    private static final String DTO_NS = "http://dto.configuration.store.user.identity.carbon.wso2.org/xsd";
+
+    /**
      * Schema namespace for the testRDBMSConnection request element and its (qualified) parameters.
      * Per the UserStoreConfigAdminService WSDL the operation schema has
      * targetNamespace="http://org.apache.axis2/xsd" with elementFormDefault="qualified", so the
@@ -193,6 +208,49 @@ public class SSRFUserstoreRdbmsConnectionTestCase extends APIMIntegrationBaseTes
     }
 
     // =========================================================================================
+    // Test: blocked host on the SAVE path (addUserStore)
+    // =========================================================================================
+
+    /**
+     * Verifies that the user-store <em>save</em> path is also gated by the SSRF policy: an
+     * {@code addUserStore} call whose JDBC {@code url} property points at the IMDS link-local
+     * address {@code 169.254.169.254} is rejected with a policy-block fault before the secondary
+     * user store is persisted.
+     *
+     * <p>This proves the now-closed SSRF bypass: previously only the "Test Connection"
+     * ({@code testRDBMSConnection}) path validated the connection URL, so a caller could skip
+     * the test and persist a malicious user store directly via {@code addUserStore}. The fix
+     * routes the {@code addUserStore} {@code connectionURL}/{@code url} property through
+     * {@code APIUtil.validateRemoteURL} before writing.
+     *
+     * <p>Expected: the SOAP response contains a fault message indicating the URL was blocked by
+     * the network security access control policy (e.g. "blocked by network security access
+     * control policy" or "not trusted").
+     */
+    @Test(groups = {"wso2.am", "ssrfUserstoreAllow"},
+            description = "SSRF Userstore SAVE [allow, 169.254.169.254 not listed]: addUserStore with a "
+                    + "JDBC url to the link-local IMDS address is blocked by the SSRF gate before persist")
+    public void testAddUserStoreBlockedHost() throws Exception {
+        String jdbcUrl = "jdbc:mysql://169.254.169.254:3306/db";
+        String responseBody = callAddUserStore(jdbcUrl);
+
+        log.info("testAddUserStoreBlockedHost response: " + responseBody);
+
+        // The SSRF gate on the save path must have fired: the fault must contain the block
+        // message from APIUtil. Accept either the primary phrasing or the older "not trusted".
+        boolean blocked = responseBody != null
+                && (responseBody.toLowerCase().contains("blocked by network security access control policy")
+                || responseBody.toLowerCase().contains("not trusted"));
+        Assert.assertTrue(blocked,
+                "Expected the SSRF gate to block the addUserStore save path for 169.254.169.254 "
+                        + "with a policy-block fault, but the response did not contain the expected "
+                        + "block message. This indicates the save-path SSRF bypass is NOT closed. "
+                        + "Response body: " + responseBody);
+        log.info("testAddUserStoreBlockedHost passed: addUserStore with 169.254.169.254 blocked by "
+                + "SSRF gate as expected (save-path bypass closed).");
+    }
+
+    // =========================================================================================
     // Helper — SOAP invocation
     // =========================================================================================
 
@@ -242,6 +300,89 @@ public class SSRFUserstoreRdbmsConnectionTestCase extends APIMIntegrationBaseTes
             return null;
         }
         log.debug("callTestRdbms: HTTP status=" + httpResponse.getResponseCode()
+                + " body=" + httpResponse.getData());
+        return httpResponse.getData();
+    }
+
+    /**
+     * Posts a SOAP 1.1 {@code addUserStore} request to {@code UserStoreConfigAdminService} and
+     * returns the raw response body as a String.
+     *
+     * <p>This exercises the user-store <em>save</em> path. A {@code UserStoreDTO} is built for a
+     * JDBC secondary user store, with the supplied JDBC URL set as the {@code url} property (the
+     * property the save-path SSRF gate validates). The remaining properties
+     * ({@code driverName}, {@code userName}, {@code password}) are included only so the DTO is
+     * well-formed.
+     *
+     * <p>The envelope respects the WSDL element ordering and namespaces:
+     * <ul>
+     *   <li>the wrapper {@code addUserStore} and its {@code userStoreDTO} param are qualified in
+     *       {@value #SER_NS} ({@code elementFormDefault="qualified"});</li>
+     *   <li>the {@code UserStoreDTO}/{@code PropertyDTO} child elements ({@code className},
+     *       {@code domainId}, {@code properties}, {@code name}, {@code value}) are qualified in
+     *       {@value #DTO_NS} — the schema for these complexTypes also uses
+     *       {@code elementFormDefault="qualified"};</li>
+     *   <li>the {@code UserStoreDTO} sequence order is {@code className}, {@code domainId},
+     *       {@code properties} (per the WSDL: className, description, disabled, domainId,
+     *       properties, repositoryClass — the omitted optional fields are skipped).</li>
+     * </ul>
+     *
+     * @param connectionURL the JDBC connection URL to persist (set as the {@code url} property),
+     *                      e.g. {@code jdbc:mysql://169.254.169.254:3306/db}
+     * @return the HTTP response body (the raw SOAP envelope or fault XML), or {@code null} if the
+     *         HTTP call itself failed at the transport level
+     * @throws Exception if the HTTPS client encounters an unrecoverable error
+     */
+    private String callAddUserStore(String connectionURL) throws Exception {
+        String serviceUrl = backendUrl + "UserStoreConfigAdminService";
+
+        // SOAP 1.1 envelope for addUserStore(UserStoreDTO).
+        //   ser = http://org.apache.axis2/xsd          (wrapper + userStoreDTO param)
+        //   dto = http://dto.configuration.store.user.identity.carbon.wso2.org/xsd (DTO children)
+        // Element order inside UserStoreDTO follows the WSDL sequence (className before domainId
+        // before properties); PropertyDTO is {name, value}.
+        String soapBody = "<soapenv:Envelope "
+                + "xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\" "
+                + "xmlns:ser=\"" + SER_NS + "\" "
+                + "xmlns:dto=\"" + DTO_NS + "\">"
+                + "<soapenv:Header/>"
+                + "<soapenv:Body>"
+                + "<ser:addUserStore>"
+                + "<ser:userStoreDTO>"
+                + "<dto:className>org.wso2.carbon.user.core.jdbc.JDBCUserStoreManager</dto:className>"
+                + "<dto:domainId>SSRF.SAVE.TEST</dto:domainId>"
+                + "<dto:properties>"
+                + "<dto:name>url</dto:name>"
+                + "<dto:value>" + connectionURL + "</dto:value>"
+                + "</dto:properties>"
+                + "<dto:properties>"
+                + "<dto:name>driverName</dto:name>"
+                + "<dto:value>com.mysql.cj.jdbc.Driver</dto:value>"
+                + "</dto:properties>"
+                + "<dto:properties>"
+                + "<dto:name>userName</dto:name>"
+                + "<dto:value>root</dto:value>"
+                + "</dto:properties>"
+                + "<dto:properties>"
+                + "<dto:name>password</dto:name>"
+                + "<dto:value>root</dto:value>"
+                + "</dto:properties>"
+                + "</ser:userStoreDTO>"
+                + "</ser:addUserStore>"
+                + "</soapenv:Body>"
+                + "</soapenv:Envelope>";
+
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Content-Type", "text/xml; charset=UTF-8");
+        headers.put("SOAPAction", "\"" + ADD_SOAP_ACTION + "\"");
+        headers.put("Authorization", BASIC_AUTH_HEADER);
+
+        HttpResponse httpResponse = HTTPSClientUtils.doPost(serviceUrl, headers, soapBody);
+        if (httpResponse == null) {
+            log.warn("callAddUserStore: HTTPSClientUtils.doPost returned null for URL: " + serviceUrl);
+            return null;
+        }
+        log.debug("callAddUserStore: HTTP status=" + httpResponse.getResponseCode()
                 + " body=" + httpResponse.getData());
         return httpResponse.getData();
     }
