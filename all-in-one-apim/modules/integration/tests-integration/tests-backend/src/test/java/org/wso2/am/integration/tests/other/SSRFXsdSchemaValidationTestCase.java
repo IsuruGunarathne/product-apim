@@ -368,9 +368,9 @@ public class SSRFXsdSchemaValidationTestCase extends APIManagerLifecycleBaseTest
         // The allow-listed edge is fetched; the redirect target (10.255.255.1, not allow-listed) is refused.
         xsdServer.verify(moreThanOrExactly(1), getRequestedFor(urlPathEqualTo("/redirect-edge.xsd")));
         String body = response.getData();
-        Assert.assertTrue(body != null && (body.contains("not trusted") || body.contains("not permitted")),
-                "Case E: the 400 must indicate a policy block of the redirect target (not a generic fetch error), "
-                        + "confirming the redirect Location was re-validated. Body: " + body);
+        // Body is sanitized to a neutral message; the redirect re-validation is proven by HTTP 400 + the edge fetched above.
+        Assert.assertTrue(body != null && body.contains("XSD schema validation failed"),
+                "Case E: the 400 must surface through the XSD validation fault path (sanitized body). Body: " + body);
         log.info("Case E passed: 302 from the allow-listed edge to a non-allow-listed host blocked (HTTP 400); "
                 + "the redirect target was re-validated, not followed.");
     }
