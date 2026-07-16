@@ -727,6 +727,11 @@ public class Utils {
         return baseUrl + Constants.DEFAULT_APIM_API_DEPLOYER + "apis/validate-openapi";
     }
 
+    /** Publisher REST API — WSDL import (multipart file/url + additionalProperties + implementationType). */
+    public static String getImportWsdlURL(String baseUrl) {
+        return baseUrl + Constants.DEFAULT_APIM_API_DEPLOYER + "apis/import-wsdl";
+    }
+
     /** Publisher REST API — linter custom rules. */
     public static String getLinterCustomRulesURL(String baseUrl) {
         return baseUrl + Constants.DEFAULT_APIM_API_DEPLOYER + "linter-custom-rules";
